@@ -1,0 +1,909 @@
+import copy
+from dataclasses import dataclass
+import gc
+import hashlib
+import math
+import os
+import re
+import tempfile
+import numpy as np
+import torch
+import json
+import struct
+from typing import Callable, Dict, Any, Union, Optional
+
+from safetensors.torch import load_file, save_file
+
+from musubi_tuner.utils.device_utils import synchronize_device
+
+
+_SAFETENSORS_TYPES = {
+    torch.float64: "F64",
+    torch.float32: "F32",
+    torch.float16: "F16",
+    torch.bfloat16: "BF16",
+    torch.int64: "I64",
+    torch.int32: "I32",
+    torch.int16: "I16",
+    torch.int8: "I8",
+    torch.uint8: "U8",
+    torch.bool: "BOOL",
+    getattr(torch, "float8_e5m2", None): "F8_E5M2",
+    getattr(torch, "float8_e4m3fn", None): "F8_E4M3",
+}
+_SAFETENSORS_TYPES.pop(None, None)
+_SAFETENSORS_TYPE_SIZES = {name: torch.empty((), dtype=dtype).element_size() for dtype, name in _SAFETENSORS_TYPES.items()}
+_SAFETENSORS_HEADER_ALIGN = 256
+_STREAMING_SAFETENSORS_STATE_VERSION = 1
+_STREAMING_SAFETENSORS_HEADER_RESERVE = 8 * 1024 * 1024
+
+
+def _make_atomic_temp_path(filename: str) -> str:
+    target_path = os.path.abspath(os.fspath(filename))
+    target_dir = os.path.dirname(target_path)
+    os.makedirs(target_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target_path)}.",
+        suffix=".tmp",
+        dir=target_dir,
+    )
+    os.close(fd)
+    return temp_path
+
+
+def _remove_temp_file(temp_path: Optional[str]) -> None:
+    if not temp_path:
+        return
+    try:
+        os.remove(temp_path)
+    except FileNotFoundError:
+        pass
+
+
+def save_file_atomic(tensors: Dict[str, torch.Tensor], filename: str, metadata: Dict[str, Any] = None) -> None:
+    temp_path = _make_atomic_temp_path(filename)
+    try:
+        save_file(tensors, temp_path, metadata=metadata)
+        os.replace(temp_path, filename)
+    except Exception:
+        _remove_temp_file(temp_path)
+        raise
+
+
+def atomic_torch_save(obj: Any, filename: str) -> None:
+    temp_path = _make_atomic_temp_path(filename)
+    try:
+        torch.save(obj, temp_path)
+        os.replace(temp_path, filename)
+    except Exception:
+        _remove_temp_file(temp_path)
+        raise
+
+
+@dataclass
+class LazyTensorForSave:
+    """Tensor descriptor materialized only when the safetensors writer reaches it."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    materialize_fn: Callable[[], torch.Tensor]
+
+    def numel(self) -> int:
+        return math.prod(self.shape)
+
+    def element_size(self) -> int:
+        return torch.empty((), dtype=self.dtype).element_size()
+
+    def materialize(self) -> torch.Tensor:
+        tensor = self.materialize_fn()
+        if tuple(tensor.shape) != self.shape:
+            raise ValueError(f"Lazy tensor shape changed during materialization: expected {self.shape}, got {tuple(tensor.shape)}")
+        if tensor.dtype != self.dtype:
+            tensor = tensor.to(dtype=self.dtype)
+        return tensor
+
+    def to(self, *args, **kwargs) -> "LazyTensorForSave":
+        target_dtype = kwargs.get("dtype", None)
+        for arg in args:
+            if isinstance(arg, torch.dtype):
+                target_dtype = arg
+            elif isinstance(arg, torch.Tensor):
+                target_dtype = arg.dtype
+        if target_dtype is None:
+            target_dtype = self.dtype
+
+        def materialize() -> torch.Tensor:
+            return self.materialize().to(*args, **kwargs)
+
+        return LazyTensorForSave(shape=self.shape, dtype=target_dtype, materialize_fn=materialize)
+
+
+def _tensor_numel(tensor: torch.Tensor | LazyTensorForSave) -> int:
+    return tensor.numel() if isinstance(tensor, LazyTensorForSave) else tensor.numel()
+
+
+def _tensor_shape(tensor: torch.Tensor | LazyTensorForSave) -> list[int]:
+    return list(tensor.shape)
+
+
+def _tensor_dtype(tensor: torch.Tensor | LazyTensorForSave) -> torch.dtype:
+    return tensor.dtype
+
+
+def _tensor_element_size(tensor: torch.Tensor | LazyTensorForSave) -> int:
+    return tensor.element_size() if isinstance(tensor, LazyTensorForSave) else tensor.element_size()
+
+
+def _write_tensor_bytes(f, tensor: torch.Tensor) -> None:
+    if tensor.dim() == 0:
+        tensor = tensor.unsqueeze(0)
+    tensor_bytes = tensor.contiguous().view(torch.uint8)
+    tensor_bytes.cpu().numpy().tofile(f)
+
+
+def _validate_safetensors_metadata(metadata: Dict[str, Any] | None) -> Dict[str, str]:
+    validated = {}
+    for key, value in (metadata or {}).items():
+        if not isinstance(key, str):
+            raise ValueError(f"Metadata key must be a string, got {type(key)}")
+        validated[key] = value if isinstance(value, str) else str(value)
+    return validated
+
+
+def _json_digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def safetensors_resume_id(source_path: str, options: Dict[str, Any]) -> str:
+    """Return a path-private fingerprint for a converter source and its output-affecting options."""
+    source_path = os.path.abspath(os.fspath(source_path))
+    source_stat = os.stat(source_path)
+    return _json_digest(
+        {
+            "source": source_path,
+            "size": int(source_stat.st_size),
+            "mtime_ns": int(source_stat.st_mtime_ns),
+            "options": options,
+        }
+    )
+
+
+class StreamingSafetensorsWriter:
+    """Write one standard safetensors file incrementally with optional crash resume.
+
+    The file starts with a fixed-size padded header region. Tensor payloads are appended
+    immediately, while the final header is installed only after every group has completed.
+    In resumable mode a sidecar journal records the last durable payload offset; an
+    uncommitted tail is truncated when the writer is reopened.
+    """
+
+    def __init__(
+        self,
+        filename: str,
+        *,
+        metadata: Dict[str, Any] | None = None,
+        resume: bool = False,
+        resume_id: str | None = None,
+        header_reserve: int = _STREAMING_SAFETENSORS_HEADER_RESERVE,
+    ):
+        self.filename = os.path.abspath(os.fspath(filename))
+        self.metadata = _validate_safetensors_metadata(metadata)
+        self.resume_enabled = bool(resume)
+        self.resume_id = str(resume_id or "")
+        self.header_reserve = int(header_reserve)
+        if self.header_reserve < _SAFETENSORS_HEADER_ALIGN:
+            raise ValueError(f"header_reserve must be at least {_SAFETENSORS_HEADER_ALIGN} bytes")
+        if self.header_reserve % _SAFETENSORS_HEADER_ALIGN:
+            raise ValueError(f"header_reserve must be divisible by {_SAFETENSORS_HEADER_ALIGN}")
+        if self.resume_enabled and not self.resume_id:
+            raise ValueError("resume_id is required when resume=True")
+
+        output_dir = os.path.dirname(self.filename)
+        os.makedirs(output_dir, exist_ok=True)
+        basename = os.path.basename(self.filename)
+        if self.resume_enabled:
+            self.temp_path = os.path.join(output_dir, f".{basename}.incomplete")
+            self.journal_path = os.path.join(output_dir, f".{basename}.resume.json")
+        else:
+            self.temp_path = _make_atomic_temp_path(self.filename)
+            self.journal_path = None
+
+        self._data_start = 8 + self.header_reserve
+        self._tensor_entries: list[dict[str, Any]] = []
+        self._tensor_names: set[str] = set()
+        self._completed_groups: set[str] = set()
+        self._progress: dict[str, Any] = {}
+        self._offset = 0
+        self._finalized = False
+        self._closed = False
+
+        temp_exists = os.path.exists(self.temp_path)
+        journal_exists = bool(self.journal_path and os.path.exists(self.journal_path))
+        if self.resume_enabled and not temp_exists and journal_exists and os.path.exists(self.filename):
+            # A crash can occur after the completed temporary file is atomically
+            # installed but before its now-stale journal is removed. Starting a
+            # fresh conversion is safe here; the existing final output remains in
+            # place until the new run finalizes.
+            _remove_temp_file(self.journal_path)
+            journal_exists = False
+        if self.resume_enabled and temp_exists != journal_exists:
+            raise RuntimeError(
+                f"Streaming safetensors resume state is incomplete for {self.filename}: "
+                "both the incomplete file and resume journal are required"
+            )
+        if self.resume_enabled and temp_exists:
+            self._load_resume_state()
+        else:
+            self._file = open(self.temp_path, "w+b")
+            self._file.write(struct.pack("<Q", self.header_reserve))
+            self._file.write(b" " * self.header_reserve)
+            self._file.flush()
+            os.fsync(self._file.fileno())
+            if self.resume_enabled:
+                self.checkpoint()
+
+    @property
+    def progress(self) -> dict[str, Any]:
+        return copy.deepcopy(self._progress)
+
+    def is_group_complete(self, group: str) -> bool:
+        return group in self._completed_groups
+
+    def write_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        if self._finalized or self._closed:
+            raise RuntimeError("Cannot write to a closed streaming safetensors writer")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Tensor name must be a non-empty string")
+        if name == "__metadata__":
+            raise ValueError("__metadata__ is reserved by the safetensors format")
+        if name in self._tensor_names:
+            raise ValueError(f"Duplicate tensor name in streaming safetensors output: {name}")
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Expected torch.Tensor for {name}, got {type(tensor)}")
+        dtype_name = _SAFETENSORS_TYPES.get(tensor.dtype)
+        if dtype_name is None:
+            raise ValueError(f"Unsupported safetensors dtype for {name}: {tensor.dtype}")
+
+        materialized = tensor.detach().contiguous()
+        size = int(materialized.numel() * materialized.element_size())
+        start = self._offset
+        end = start + size
+        self._file.seek(self._data_start + start)
+        try:
+            if size:
+                _write_tensor_bytes(self._file, materialized)
+        except Exception:
+            self._file.truncate(self._data_start + start)
+            self._file.seek(self._data_start + start)
+            raise
+        self._tensor_entries.append(
+            {
+                "name": name,
+                "dtype": dtype_name,
+                "shape": list(materialized.shape),
+                "data_offsets": [start, end],
+            }
+        )
+        self._tensor_names.add(name)
+        self._offset = end
+
+    def mark_group_complete(self, group: str) -> None:
+        if not isinstance(group, str) or not group:
+            raise ValueError("Completed group name must be a non-empty string")
+        self._completed_groups.add(group)
+
+    def checkpoint(self, *, progress: dict[str, Any] | None = None) -> None:
+        if self._finalized or self._closed:
+            raise RuntimeError("Cannot checkpoint a closed streaming safetensors writer")
+        if progress is not None:
+            self._progress = copy.deepcopy(progress)
+        self._file.flush()
+        if not self.resume_enabled:
+            return
+        os.fsync(self._file.fileno())
+        state = {
+            "version": _STREAMING_SAFETENSORS_STATE_VERSION,
+            "resume_id": self.resume_id,
+            "metadata_digest": _json_digest(self.metadata),
+            "header_reserve": self.header_reserve,
+            "offset": self._offset,
+            "tensors": self._tensor_entries,
+            "completed_groups": sorted(self._completed_groups),
+            "progress": self._progress,
+        }
+        journal_temp = _make_atomic_temp_path(self.journal_path)
+        try:
+            with open(journal_temp, "w", encoding="utf-8") as journal:
+                json.dump(state, journal, sort_keys=True, separators=(",", ":"))
+                journal.flush()
+                os.fsync(journal.fileno())
+            os.replace(journal_temp, self.journal_path)
+        except Exception:
+            _remove_temp_file(journal_temp)
+            raise
+
+    def finalize(self, *, progress: dict[str, Any] | None = None) -> None:
+        if self._finalized:
+            return
+        self.checkpoint(progress=progress)
+        header: dict[str, Any] = {}
+        if self.metadata:
+            header["__metadata__"] = self.metadata
+        for entry in self._tensor_entries:
+            header[entry["name"]] = {
+                "dtype": entry["dtype"],
+                "shape": entry["shape"],
+                "data_offsets": entry["data_offsets"],
+            }
+        encoded = json.dumps(header, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        if len(encoded) > self.header_reserve:
+            raise RuntimeError(
+                f"Safetensors header requires {len(encoded)} bytes, exceeding the reserved {self.header_reserve} bytes"
+            )
+        encoded += b" " * (self.header_reserve - len(encoded))
+        self._file.seek(0)
+        self._file.write(struct.pack("<Q", self.header_reserve))
+        self._file.write(encoded)
+        self._file.truncate(self._data_start + self._offset)
+        self._file.flush()
+        os.fsync(self._file.fileno())
+        self._file.close()
+        self._closed = True
+        os.replace(self.temp_path, self.filename)
+        if self.journal_path:
+            _remove_temp_file(self.journal_path)
+        self._finalized = True
+
+    def close(self) -> None:
+        if not self._closed:
+            self._file.close()
+            self._closed = True
+
+    def _load_resume_state(self) -> None:
+        with open(self.journal_path, "r", encoding="utf-8") as journal:
+            state = json.load(journal)
+        if state.get("version") != _STREAMING_SAFETENSORS_STATE_VERSION:
+            raise RuntimeError(f"Unsupported streaming safetensors resume state version: {state.get('version')}")
+        if state.get("resume_id") != self.resume_id:
+            raise RuntimeError("Streaming safetensors resume state does not match the requested source/options")
+        if state.get("metadata_digest") != _json_digest(self.metadata):
+            raise RuntimeError("Streaming safetensors resume metadata does not match the requested output metadata")
+        if int(state.get("header_reserve", -1)) != self.header_reserve:
+            raise RuntimeError("Streaming safetensors header reserve changed since the interrupted run")
+
+        entries = state.get("tensors", [])
+        if not isinstance(entries, list):
+            raise RuntimeError("Streaming safetensors resume journal has an invalid tensor list")
+        offset = 0
+        names: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError("Streaming safetensors resume journal has an invalid tensor entry")
+            name = entry.get("name")
+            dtype_name = entry.get("dtype")
+            shape = entry.get("shape")
+            data_offsets = entry.get("data_offsets")
+            if (
+                not isinstance(name, str)
+                or not name
+                or name == "__metadata__"
+                or not isinstance(dtype_name, str)
+                or dtype_name not in _SAFETENSORS_TYPE_SIZES
+                or not isinstance(shape, list)
+                or any(not isinstance(dim, int) or isinstance(dim, bool) or dim < 0 for dim in shape)
+                or not isinstance(data_offsets, list)
+                or len(data_offsets) != 2
+                or any(not isinstance(value, int) or isinstance(value, bool) for value in data_offsets)
+            ):
+                raise RuntimeError("Streaming safetensors resume journal has invalid tensor metadata")
+            start, end = data_offsets
+            expected_size = math.prod(shape) * _SAFETENSORS_TYPE_SIZES[dtype_name]
+            if name in names or start != offset or end < start or end - start != expected_size:
+                raise RuntimeError("Streaming safetensors resume journal has invalid tensor offsets")
+            names.add(name)
+            offset = end
+        if offset != int(state.get("offset", -1)):
+            raise RuntimeError("Streaming safetensors resume journal has an invalid final offset")
+
+        self._tensor_entries = entries
+        self._tensor_names = names
+        completed_groups = state.get("completed_groups", [])
+        progress = state.get("progress", {})
+        if not isinstance(completed_groups, list) or any(not isinstance(group, str) or not group for group in completed_groups):
+            raise RuntimeError("Streaming safetensors resume journal has invalid completed groups")
+        if not isinstance(progress, dict):
+            raise RuntimeError("Streaming safetensors resume journal has invalid progress")
+        self._completed_groups = set(completed_groups)
+        self._progress = progress
+        self._offset = offset
+        self._file = open(self.temp_path, "r+b")
+        expected_size = self._data_start + self._offset
+        actual_size = os.fstat(self._file.fileno()).st_size
+        if actual_size < expected_size:
+            self._file.close()
+            raise RuntimeError("Streaming safetensors incomplete file is shorter than its resume journal")
+        self._file.seek(0)
+        stored_reserve = struct.unpack("<Q", self._file.read(8))[0]
+        if stored_reserve != self.header_reserve:
+            self._file.close()
+            raise RuntimeError("Streaming safetensors incomplete file has an invalid reserved header")
+        if actual_size > expected_size:
+            self._file.truncate(expected_size)
+        self._file.seek(expected_size)
+
+    def __enter__(self) -> "StreamingSafetensorsWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+        if not self._finalized and not self.resume_enabled:
+            _remove_temp_file(self.temp_path)
+
+
+def mem_eff_save_file(
+    tensors: Dict[str, torch.Tensor | LazyTensorForSave],
+    filename: str,
+    metadata: Dict[str, Any] = None,
+    *,
+    atomic: bool = False,
+):
+    """
+    memory efficient save file
+    """
+
+    # print(f"Using memory efficient save file: {filename}")
+
+    header = {}
+    offset = 0
+    if metadata:
+        header["__metadata__"] = _validate_safetensors_metadata(metadata)
+    for k, v in tensors.items():
+        if _tensor_numel(v) == 0:  # empty tensor
+            header[k] = {
+                "dtype": _SAFETENSORS_TYPES[_tensor_dtype(v)],
+                "shape": _tensor_shape(v),
+                "data_offsets": [offset, offset],
+            }
+        else:
+            size = _tensor_numel(v) * _tensor_element_size(v)
+            header[k] = {
+                "dtype": _SAFETENSORS_TYPES[_tensor_dtype(v)],
+                "shape": _tensor_shape(v),
+                "data_offsets": [offset, offset + size],
+            }
+            offset += size
+
+    hjson = json.dumps(header).encode("utf-8")
+    hjson += b" " * (-(len(hjson) + 8) % _SAFETENSORS_HEADER_ALIGN)
+
+    temp_path = _make_atomic_temp_path(filename) if atomic else None
+    output_filename = temp_path if temp_path is not None else filename
+    try:
+        with open(output_filename, "wb") as f:
+            f.write(struct.pack("<Q", len(hjson)))
+            f.write(hjson)
+
+            for k, v in tensors.items():
+                if _tensor_numel(v) == 0:
+                    continue
+                materialized = v.materialize() if isinstance(v, LazyTensorForSave) else v
+                try:
+                    if materialized.is_cuda:
+                        # Direct GPU to disk save
+                        with torch.cuda.device(materialized.device):
+                            _write_tensor_bytes(f, materialized)
+                    else:
+                        # CPU tensor save
+                        _write_tensor_bytes(f, materialized)
+                finally:
+                    if isinstance(v, LazyTensorForSave):
+                        del materialized
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+        if temp_path is not None:
+            os.replace(temp_path, filename)
+    except Exception:
+        _remove_temp_file(temp_path)
+        raise
+
+
+class MemoryEfficientSafeOpen:
+    """Memory-efficient reader for safetensors files.
+
+    This class provides a memory-efficient way to read tensors from safetensors files
+    by using memory mapping for large tensors and avoiding unnecessary copies.
+    """
+
+    def __init__(self, filename, disable_numpy_memmap=False):
+        """Initialize the SafeTensor reader.
+
+        Args:
+            filename (str): Path to the safetensors file to read.
+            disable_numpy_memmap (bool): If True, disable numpy memory mapping for large tensors, using standard file read instead.
+        """
+        self.filename = filename
+        self.file = open(filename, "rb")
+        self.header, self.header_size = self._read_header()
+        self.disable_numpy_memmap = disable_numpy_memmap
+
+    def __enter__(self):
+        """Enter context manager."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager and close file."""
+        self.file.close()
+
+    def keys(self):
+        """Get all tensor keys in the file.
+
+        Returns:
+            list: List of tensor names (excludes metadata).
+        """
+        return [k for k in self.header.keys() if k != "__metadata__"]
+
+    def metadata(self) -> Dict[str, str]:
+        """Get metadata from the file.
+
+        Returns:
+            Dict[str, str]: Metadata dictionary.
+        """
+        return self.header.get("__metadata__", {})
+
+    def _read_header(self):
+        """Read and parse the header from the safetensors file.
+
+        Returns:
+            tuple: (header_dict, header_size) containing parsed header and its size.
+        """
+        # Read header size (8 bytes, little-endian unsigned long long)
+        header_size = struct.unpack("<Q", self.file.read(8))[0]
+        # Read and decode header JSON
+        header_json = self.file.read(header_size).decode("utf-8")
+        return json.loads(header_json), header_size
+
+    def get_tensor(self, key: str, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
+        """Load a tensor from the file with memory-efficient strategies.
+
+        **Note:**
+        If device is 'cuda' , the transfer to GPU is done efficiently using pinned memory and non-blocking transfer.
+        So you must ensure that the transfer is completed before using the tensor (e.g., by `torch.cuda.synchronize()`).
+
+        If the tensor is large (>10MB) and the target device is CUDA, memory mapping with numpy.memmap is used to avoid intermediate copies.
+
+        Args:
+            key (str): Name of the tensor to load.
+            device (Optional[torch.device]): Target device for the tensor.
+            dtype (Optional[torch.dtype]): Target dtype for the tensor.
+
+        Returns:
+            torch.Tensor: The loaded tensor.
+
+        Raises:
+            KeyError: If the tensor key is not found in the file.
+        """
+        if key not in self.header:
+            raise KeyError(f"Tensor '{key}' not found in the file")
+
+        metadata = self.header[key]
+        offset_start, offset_end = metadata["data_offsets"]
+        num_bytes = offset_end - offset_start
+
+        original_dtype = self._get_torch_dtype(metadata["dtype"])
+        target_dtype = dtype if dtype is not None else original_dtype
+
+        # Handle empty tensors
+        if num_bytes == 0:
+            return torch.empty(metadata["shape"], dtype=target_dtype, device=device)
+
+        # Determine if we should use pinned memory for GPU transfer
+        non_blocking = device is not None and device.type == "cuda"
+
+        # Calculate absolute file offset
+        tensor_offset = self.header_size + 8 + offset_start  # adjust offset by header size
+
+        # Memory mapping strategy for large tensors to GPU
+        # Use memmap for large tensors to avoid intermediate copies.
+        # If device is cpu, tensor is not copied to gpu, so using memmap locks the file, which is not desired.
+        # So we only use memmap if device is not cpu.
+        # If disable_numpy_memmap is True, skip numpy memory mapping to load with standard file read.
+        if not self.disable_numpy_memmap and num_bytes > 10 * 1024 * 1024 and device is not None and device.type != "cpu":
+            # Create memory map for zero-copy reading
+            mm = np.memmap(self.filename, mode="c", dtype=np.uint8, offset=tensor_offset, shape=(num_bytes,))
+            byte_tensor = torch.from_numpy(mm)  # zero copy
+            del mm
+
+            # Deserialize tensor (view and reshape)
+            cpu_tensor = self._deserialize_tensor(byte_tensor, metadata)  # view and reshape
+            del byte_tensor
+
+            # Transfer to target device and dtype
+            gpu_tensor = cpu_tensor.to(device=device, dtype=target_dtype, non_blocking=non_blocking)
+            del cpu_tensor
+            return gpu_tensor
+
+        # Standard file reading strategy for smaller tensors or CPU target
+        # seek to the specified position
+        self.file.seek(tensor_offset)
+
+        # read directly into a numpy array by numpy.fromfile without intermediate copy
+        numpy_array = np.fromfile(self.file, dtype=np.uint8, count=num_bytes)
+        byte_tensor = torch.from_numpy(numpy_array)
+        del numpy_array
+
+        # deserialize (view and reshape)
+        deserialized_tensor = self._deserialize_tensor(byte_tensor, metadata)
+        del byte_tensor
+
+        # cast to target dtype and move to device
+        return deserialized_tensor.to(device=device, dtype=target_dtype, non_blocking=non_blocking)
+
+    def _deserialize_tensor(self, byte_tensor: torch.Tensor, metadata: Dict):
+        """Deserialize byte tensor to the correct shape and dtype.
+
+        Args:
+            byte_tensor (torch.Tensor): Raw byte tensor from file.
+            metadata (Dict): Tensor metadata containing dtype and shape info.
+
+        Returns:
+            torch.Tensor: Deserialized tensor with correct shape and dtype.
+        """
+        dtype = self._get_torch_dtype(metadata["dtype"])
+        shape = metadata["shape"]
+
+        # Handle special float8 types
+        if metadata["dtype"] in ["F8_E5M2", "F8_E4M3"]:
+            return self._convert_float8(byte_tensor, metadata["dtype"], shape)
+
+        # Standard conversion: view as target dtype and reshape
+        return byte_tensor.view(dtype).reshape(shape)
+
+    @staticmethod
+    def _get_torch_dtype(dtype_str):
+        """Convert string dtype to PyTorch dtype.
+
+        Args:
+            dtype_str (str): String representation of the dtype.
+
+        Returns:
+            torch.dtype: Corresponding PyTorch dtype.
+        """
+        # Standard dtype mappings
+        dtype_map = {
+            "F64": torch.float64,
+            "F32": torch.float32,
+            "F16": torch.float16,
+            "BF16": torch.bfloat16,
+            "I64": torch.int64,
+            "I32": torch.int32,
+            "I16": torch.int16,
+            "I8": torch.int8,
+            "U8": torch.uint8,
+            "BOOL": torch.bool,
+        }
+        # Add float8 types if available in PyTorch version
+        if hasattr(torch, "float8_e5m2"):
+            dtype_map["F8_E5M2"] = torch.float8_e5m2
+        if hasattr(torch, "float8_e4m3fn"):
+            dtype_map["F8_E4M3"] = torch.float8_e4m3fn
+        return dtype_map.get(dtype_str)
+
+    @staticmethod
+    def _convert_float8(byte_tensor, dtype_str, shape):
+        """Convert byte tensor to float8 format if supported.
+
+        Args:
+            byte_tensor (torch.Tensor): Raw byte tensor.
+            dtype_str (str): Float8 dtype string ("F8_E5M2" or "F8_E4M3").
+            shape (tuple): Target tensor shape.
+
+        Returns:
+            torch.Tensor: Tensor with float8 dtype.
+
+        Raises:
+            ValueError: If float8 type is not supported in current PyTorch version.
+        """
+        # Convert to specific float8 types if available
+        if dtype_str == "F8_E5M2" and hasattr(torch, "float8_e5m2"):
+            return byte_tensor.view(torch.float8_e5m2).reshape(shape)
+        elif dtype_str == "F8_E4M3" and hasattr(torch, "float8_e4m3fn"):
+            return byte_tensor.view(torch.float8_e4m3fn).reshape(shape)
+        else:
+            # Float8 not supported in this PyTorch version
+            raise ValueError(f"Unsupported float8 type: {dtype_str} (upgrade PyTorch to support float8 types)")
+
+
+def load_safetensors(
+    path: str,
+    device: Union[str, torch.device],
+    disable_mmap: bool = False,
+    dtype: Optional[torch.dtype] = None,
+    disable_numpy_memmap: bool = False,
+) -> dict[str, torch.Tensor]:
+    if disable_mmap:
+        # return safetensors.torch.load(open(path, "rb").read())
+        # use experimental loader
+        # logger.info(f"Loading without mmap (experimental)")
+        state_dict = {}
+        device = torch.device(device) if device is not None else None
+        with MemoryEfficientSafeOpen(path, disable_numpy_memmap=disable_numpy_memmap) as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key, device=device, dtype=dtype)
+        synchronize_device(device)
+        return state_dict
+    else:
+        try:
+            state_dict = load_file(path, device=device)
+        except:
+            state_dict = load_file(path)  # prevent device invalid Error
+        if dtype is not None:
+            for key in state_dict.keys():
+                state_dict[key] = state_dict[key].to(dtype=dtype)
+        return state_dict
+
+
+def get_split_weight_filenames(file_path: str) -> Optional[list[str]]:
+    """
+    Get the list of split weight filenames (full paths) if the file name ends with 00001-of-00004 etc.
+    Returns None if the file is not split.
+    """
+    basename = os.path.basename(file_path)
+    match = re.match(r"^(.*?)(\d+)-of-(\d+)\.safetensors$", basename)
+    if match:
+        prefix = basename[: match.start(2)]
+        count = int(match.group(3))
+        filenames = []
+        for i in range(count):
+            filename = f"{prefix}{i + 1:05d}-of-{count:05d}.safetensors"
+            filepath = os.path.join(os.path.dirname(file_path), filename)
+            if os.path.exists(filepath):
+                filenames.append(filepath)
+            else:
+                raise FileNotFoundError(f"File {filepath} not found")
+        return filenames
+    else:
+        return None
+
+
+def load_split_weights(
+    file_path: str, device: Union[str, torch.device] = "cpu", disable_mmap: bool = False, dtype: Optional[torch.dtype] = None
+) -> Dict[str, torch.Tensor]:
+    """
+    Load split weights from a file. If the file name ends with 00001-of-00004 etc, it will load all files with the same prefix.
+    dtype is as is, no conversion is done.
+    """
+    device = torch.device(device)
+
+    # if the file name ends with 00001-of-00004 etc, we need to load the files with the same prefix
+    split_filenames = get_split_weight_filenames(file_path)
+    if split_filenames is not None:
+        state_dict = {}
+        for filename in split_filenames:
+            state_dict.update(load_safetensors(filename, device=device, disable_mmap=disable_mmap, dtype=dtype))
+    else:
+        state_dict = load_safetensors(file_path, device=device, disable_mmap=disable_mmap, dtype=dtype)
+    return state_dict
+
+
+def find_key(safetensors_file: str, starts_with: Optional[str] = None, ends_with: Optional[str] = None) -> Optional[str]:
+    """
+    Find a key in a safetensors file that starts with `starts_with` and ends with `ends_with`.
+    If `starts_with` is None, it will match any key.
+    If `ends_with` is None, it will match any key.
+    Returns the first matching key or None if no key matches.
+    """
+    with MemoryEfficientSafeOpen(safetensors_file) as f:
+        for key in f.keys():
+            if (starts_with is None or key.startswith(starts_with)) and (ends_with is None or key.endswith(ends_with)):
+                return key
+    return None
+
+
+def find_keys(safetensors_file: str, starts_with: Optional[str] = None, ends_with: Optional[str] = None) -> list[str]:
+    """
+    Find all keys in a safetensors file that start with `starts_with` and end with `ends_with`.
+    If `starts_with` is None, it will match any key. If `ends_with` is None, it will match any key.
+
+    The matching keys are returned sorted, so callers get a deterministic order regardless of the
+    order the keys happen to be stored in the file header. This matters when the keys are folded into
+    a bucket key (e.g. ``latents_control_{i}``): otherwise two files holding the same tensors in a
+    different header order, or with the index<->shape association swapped, could end up in different
+    buckets or be wrongly batched together.
+    """
+    with MemoryEfficientSafeOpen(safetensors_file) as f:
+        keys = [
+            key
+            for key in f.keys()
+            if (starts_with is None or key.startswith(starts_with)) and (ends_with is None or key.endswith(ends_with))
+        ]
+    return sorted(keys)
+
+
+@dataclass
+class WeightTransformHooks:
+    split_hook: Optional[callable] = None
+    concat_hook: Optional[callable] = None
+
+
+class TensorWeightAdapter:
+    """
+    A wrapper for weight conversion hooks (split and concat) to be used with MemoryEfficientSafeOpen.
+    This wrapper adapts the original MemoryEfficientSafeOpen to apply the provided split and concat hooks
+    when loading tensors.
+
+    split_hook: A callable that takes (original_key: str, original_tensor: torch.Tensor) and returns (new_keys: list[str], new_tensors: list[torch.Tensor]).
+    concat_hook: A callable that takes (original_key: str, tensors: dict[str, torch.Tensor]) and returns (new_key: str,  concatenated_tensor: torch.Tensor).
+
+    If tensors is None, the hook should return only the new keys (for split) or new key (for concat), without tensors.
+
+    No need to implement __enter__ and __exit__ methods, as they are handled by the original MemoryEfficientSafeOpen.
+    Do not use this wrapper as a context manager directly, like `with WeightConvertHookWrapper(...) as f:`.
+
+    **concat_hook is not tested yet.**
+    """
+
+    def __init__(self, weight_convert_hook: WeightTransformHooks, original_f: MemoryEfficientSafeOpen):
+        self.original_f = original_f
+        self.new_key_to_original_key_map: dict[
+            str, Union[str, list[str]]
+        ] = {}  # for split: new_key -> original_key; for concat: new_key -> list of original_keys
+        self.concat_key_set = set()  # set of keys that are created by concat_hook, to distinguish from split_hook
+        self.new_keys = []
+        self.tensor_cache = {}  # cache for split tensors
+        self.split_hook = weight_convert_hook.split_hook
+        self.concat_hook = weight_convert_hook.concat_hook
+
+        for key in self.original_f.keys():
+            if self.split_hook is not None:
+                converted_keys, _ = self.split_hook(key, None)  # get new keys only
+                if converted_keys is not None:
+                    for new_key in converted_keys:
+                        self.new_key_to_original_key_map[new_key] = key
+                    self.new_keys.extend(converted_keys)
+                    continue  # skip concat_hook if split_hook is applied
+
+            if self.concat_hook is not None:
+                converted_key, _ = self.concat_hook(key, None)  # get new key only
+                if converted_key is not None:
+                    if converted_key not in self.concat_key_set:  # first time seeing this concatenated key
+                        self.concat_key_set.add(converted_key)
+                        self.new_key_to_original_key_map[converted_key] = []
+
+                    # multiple original keys map to the same concatenated key
+                    self.new_key_to_original_key_map[converted_key].append(key)
+
+                    self.new_keys.append(converted_key)
+                    continue  # skip to next key
+
+            # direct mapping
+            self.new_keys.append(key)
+
+    def keys(self) -> list[str]:
+        return self.new_keys
+
+    def get_tensor(self, new_key: str, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        # load tensor by new_key, applying split or concat hooks as needed
+        if new_key not in self.new_key_to_original_key_map:
+            # direct mapping
+            return self.original_f.get_tensor(new_key, device=device, dtype=dtype)
+
+        elif new_key not in self.concat_key_set:
+            # split hook: split key is requested multiple times, so we cache the result
+            original_key = self.new_key_to_original_key_map[new_key]
+            if original_key not in self.tensor_cache:  # not yet split
+                original_tensor = self.original_f.get_tensor(original_key, device=device, dtype=dtype)
+                new_keys, new_tensors = self.split_hook(original_key, original_tensor)  # apply split hook
+                for k, t in zip(new_keys, new_tensors):
+                    self.tensor_cache[k] = t
+            return self.tensor_cache.pop(new_key)  # return and remove from cache
+
+        else:
+            # concat hook: concatenated key is requested only once, so we do not cache the result
+            tensors = {}
+            for original_key in self.new_key_to_original_key_map[new_key]:
+                tensor = self.original_f.get_tensor(original_key, device=device, dtype=dtype)
+                tensors[original_key] = tensor
+            _, concatenated_tensors = self.concat_hook(self.new_key_to_original_key_map[new_key][0], tensors)  # apply concat hook
+            return concatenated_tensors

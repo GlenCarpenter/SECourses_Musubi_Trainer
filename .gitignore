@@ -38,11 +38,14 @@ tests/*
 !tests/test_automagic_gui.py
 !tests/test_sdpa_gui.py
 lib64/
+!musubi-tuner/src/musubi_tuner/gui_dashboard/frontend/src/lib/
+!musubi-tuner/src/musubi_tuner/gui_dashboard/frontend/src/lib/**
+!musubi-tuner/src/musubi_tuner/gui_dashboard/frontend/dist/
+!musubi-tuner/src/musubi_tuner/gui_dashboard/frontend/dist/**
 Z_Image_BF16.safetensors
 convert_nvfp4_learned.bat
 convert_to_quant2/
 parts/
-musubi-tuner
 convert_to_quant
 dataset_tomls/
 .vs/
