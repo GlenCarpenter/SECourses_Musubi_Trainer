@@ -29,6 +29,7 @@ from .common_gui import (
     get_vae_model_path,
     get_text_encoder_path,
     get_clip_vision_path,
+    load_toml_sanitized,
     print_command_and_toml,
     resolve_portable_model_value,
     run_cmd_advanced_training,
@@ -120,7 +121,7 @@ def wan_config_has_compile_residency_override(
     if not path or not os.path.isfile(path):
         return bool(current_value)
     try:
-        return COMPILE_RESIDENT_BLOCKS_KEY in toml.load(path)
+        return COMPILE_RESIDENT_BLOCKS_KEY in load_toml_sanitized(path)
     except (OSError, toml.TomlDecodeError):
         return bool(current_value)
 
@@ -3051,7 +3052,7 @@ def train_wan_model(headless, print_only, parameters):
         # Verify TOML file was created and check its contents
         if os.path.exists(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
-                toml_content = toml.load(f)
+                toml_content = load_toml_sanitized(f)
                 use_pinned_memory_in_toml = toml_content.get("use_pinned_memory_for_block_swap", None)
                 log.info(f"After SaveConfigFileToRun - TOML file contents check:")
                 log.info(f"  use_pinned_memory_for_block_swap = {use_pinned_memory_in_toml}")
@@ -3264,7 +3265,7 @@ def open_wan_configuration(ask_for_file, file_path, parameters):
 
         try:
             with open(file_path, "r", encoding="utf-8-sig") as f:
-                my_data = toml.load(f)
+                my_data = load_toml_sanitized(f)
                 
                 # Validate and auto-correct corrupted parameter values from old bugs
                 # Bug: one_frame and num_frames could get swapped due to parameter order mismatch

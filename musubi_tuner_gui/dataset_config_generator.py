@@ -4,7 +4,13 @@ import toml
 import glob
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from .common_gui import validate_path_for_toml, normalize_path, is_path_safe
+from .common_gui import (
+    is_path_safe,
+    load_toml_sanitized,
+    normalize_path,
+    normalize_toml_path_values,
+    validate_path_for_toml,
+)
 
 
 # Kohya-style dataset folders carry the repeat count as a numeric prefix:
@@ -810,7 +816,7 @@ def generate_dataset_config_from_folders(
 def save_dataset_config(config: Dict, output_path: str) -> None:
     """Save the dataset configuration to a TOML file."""
     with open(output_path, 'w', encoding='utf-8') as f:
-        toml.dump(config, f)
+        toml.dump(normalize_toml_path_values(config), f)
     
     # Remove trailing commas from arrays (cosmetic improvement for TOML spec compliance)
     with open(output_path, 'r', encoding='utf-8') as f:
@@ -832,7 +838,7 @@ def validate_dataset_config(config_path: str) -> Tuple[bool, List[str]]:
     
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
-            config = toml.load(f)
+            config = load_toml_sanitized(f)
         
         # Check for required sections
         if "datasets" not in config or not config["datasets"]:

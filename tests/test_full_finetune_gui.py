@@ -27,11 +27,16 @@ from musubi_tuner_gui.full_finetune_gui import (
     training_mode_runtime_exclusions,
 )
 from musubi_tuner_gui.modern_image_lora_gui import (
+    KREA2_EDIT_FIT_PROTOCOL,
+    KREA2_EDIT_TEXT_CACHE_REUSE,
+    KREA2_IMAGE_EDIT_TASK,
     ModernImageWorkflow,
     _architecture_defaults,
     _build_workflow_script,
+    _create_krea2_edit_dataset_config,
     get_architecture,
     prepare_modern_image_workflow,
+    resolve_krea2_task_state,
 )
 from musubi_tuner_gui.class_tab_config_manager import TabConfigManager
 
@@ -622,6 +627,200 @@ def test_modern_legacy_sdpa_persists_in_runtime_config(tmp_path: Path, spec_key:
     assert dict(workflow.parameters)["use_legacy_sdpa"] is True
     assert runtime["use_legacy_sdpa"] is True
     assert _architecture_defaults(spec)["use_legacy_sdpa"] is False
+
+
+def test_krea2_edit_dataset_config_preserves_ordered_references_and_batch_size(tmp_path: Path):
+    targets = tmp_path / "targets"
+    source_a = tmp_path / "source-a"
+    source_b = tmp_path / "source-b"
+    output = tmp_path / "output"
+    for directory in (targets, source_a, source_b):
+        directory.mkdir()
+
+    path, _messages = _create_krea2_edit_dataset_config(
+        target_directory=str(targets),
+        reference_directory=str(source_a),
+        reference_directory_2=str(source_b),
+        resolution_width=1024,
+        resolution_height=768,
+        caption_extension=".txt",
+        enable_bucket=True,
+        bucket_no_upscale=False,
+        cache_directory="cache_dir",
+        output_dir=str(output),
+    )
+
+    config = toml.load(path)
+    assert config["general"]["batch_size"] == 1
+    assert config["general"]["resolution"] == [1024, 768]
+    assert Path(config["datasets"][0]["image_directory"]) == targets.resolve()
+    assert [Path(path) for path in config["datasets"][0]["reference_directories"]] == [
+        source_a.resolve(),
+        source_b.resolve(),
+    ]
+
+
+def test_krea2_edit_workflow_selects_all_edit_scripts_and_persists_mode(tmp_path: Path):
+    spec = get_architecture("krea2")
+    values = _architecture_defaults(spec)
+    values.update(
+        {
+            "krea2_task": KREA2_IMAGE_EDIT_TASK,
+            "dataset_config": _touch(tmp_path / "dataset.toml"),
+            "dit": _touch(tmp_path / "dit.safetensors"),
+            "vae": _touch(tmp_path / "vae.safetensors"),
+            "text_encoder": _touch(tmp_path / "text_encoder.safetensors"),
+            "output_dir": str(tmp_path / "output"),
+            "output_name": "edit-lora",
+            "grounding_pixels": 512,
+            "blocks_to_swap": 0,
+            "block_swap_h2d_only": False,
+        }
+    )
+    config_path = tmp_path / "runtime.toml"
+
+    workflow = prepare_modern_image_workflow(
+        "krea2",
+        list(values.items()),
+        str(config_path),
+        python_cmd="python",
+    )
+    runtime = toml.load(config_path)
+
+    assert Path(workflow.latent_cache_command[1]).name == "krea2_edit_cache_latents.py"
+    assert Path(workflow.text_cache_command[1]).name == "krea2_edit_cache_text_encoder_outputs.py"
+    assert workflow.text_cache_command[-2:] == ["--grounding_pixels", "512"]
+    assert Path(workflow.train_command[-3]).name == "krea2_edit_train_network.py"
+    assert runtime["krea2_task"] == KREA2_IMAGE_EDIT_TASK
+    assert runtime["edit_fit_protocol"] == KREA2_EDIT_FIT_PROTOCOL
+    assert runtime["grounding_pixels"] == 512
+
+
+def test_krea2_edit_reuse_policy_skips_text_cache_command(tmp_path: Path):
+    spec = get_architecture("krea2")
+    values = _architecture_defaults(spec)
+    values.update(
+        {
+            "krea2_task": KREA2_IMAGE_EDIT_TASK,
+            "edit_text_cache_policy": KREA2_EDIT_TEXT_CACHE_REUSE,
+            "dataset_config": _touch(tmp_path / "dataset.toml"),
+            "dit": _touch(tmp_path / "dit.safetensors"),
+            "vae": _touch(tmp_path / "vae.safetensors"),
+            "text_encoder": _touch(tmp_path / "text_encoder.safetensors"),
+            "output_dir": str(tmp_path / "output"),
+            "blocks_to_swap": 0,
+            "block_swap_h2d_only": False,
+        }
+    )
+
+    workflow = prepare_modern_image_workflow(
+        "krea2",
+        list(values.items()),
+        str(tmp_path / "runtime.toml"),
+        python_cmd="python",
+    )
+
+    assert workflow.latent_cache_command is not None
+    assert workflow.text_cache_command is None
+
+
+def test_krea2_edit_rejects_full_fine_tuning(tmp_path: Path):
+    spec = get_architecture("krea2")
+    values = _architecture_defaults(spec)
+    values.update(
+        {
+            "krea2_task": KREA2_IMAGE_EDIT_TASK,
+            "training_mode": FULL_FINE_TUNING_MODE,
+        }
+    )
+
+    with pytest.raises(ValueError, match="supports LoRA training only"):
+        prepare_modern_image_workflow(
+            "krea2",
+            list(values.items()),
+            str(tmp_path / "runtime.toml"),
+            validate_paths=False,
+            python_cmd="python",
+        )
+
+
+def test_krea2_edit_hand_saved_config_round_trip(tmp_path: Path, monkeypatch):
+    spec = get_architecture("krea2")
+    values = _architecture_defaults(spec)
+    values.update(
+        {
+            "krea2_task": KREA2_IMAGE_EDIT_TASK,
+            "reference_directory": str(tmp_path / "source-a"),
+            "reference_directory_2": str(tmp_path / "source-b"),
+            "grounding_pixels": 640,
+            "edit_text_cache_policy": KREA2_EDIT_TEXT_CACHE_REUSE,
+        }
+    )
+    config_path = tmp_path / "edit-preset.toml"
+    monkeypatch.setattr(gr, "Info", lambda *_args, **_kwargs: None)
+
+    modern_image_lora_gui.save_modern_configuration(
+        "krea2", False, str(config_path), list(values.items())
+    )
+    fresh = list(_architecture_defaults(spec).items())
+    loaded = modern_image_lora_gui.open_modern_configuration(
+        "krea2", False, str(config_path), fresh
+    )
+    loaded_values = dict(zip((key for key, _value in fresh), loaded[2:]))
+
+    assert loaded_values["krea2_task"] == KREA2_IMAGE_EDIT_TASK
+    assert loaded_values["training_mode"] == LORA_TRAINING_MODE
+    assert Path(loaded_values["reference_directory"]) == tmp_path / "source-a"
+    assert Path(loaded_values["reference_directory_2"]) == tmp_path / "source-b"
+    assert loaded_values["edit_fit_protocol"] == KREA2_EDIT_FIT_PROTOCOL
+    assert loaded_values["grounding_pixels"] == 640
+    assert loaded_values["edit_text_cache_policy"] == KREA2_EDIT_TEXT_CACHE_REUSE
+
+
+@pytest.mark.parametrize(
+    ("task", "training_mode", "expected"),
+    [
+        (KREA2_IMAGE_EDIT_TASK, FULL_FINE_TUNING_MODE, (True, LORA_TRAINING_MODE, False)),
+        ("Text-to-Image", FULL_FINE_TUNING_MODE, (False, FULL_FINE_TUNING_MODE, True)),
+    ],
+)
+def test_krea2_task_state_controls_edit_and_sample_panels(task, training_mode, expected):
+    assert resolve_krea2_task_state(get_architecture("krea2"), task, training_mode) == expected
+
+
+def test_krea2_edit_print_workflow_contains_all_three_edit_scripts(tmp_path: Path, monkeypatch):
+    spec = get_architecture("krea2")
+    values = _architecture_defaults(spec)
+    values.update(
+        {
+            "krea2_task": KREA2_IMAGE_EDIT_TASK,
+            "dataset_config_mode": "Use TOML File",
+            "dataset_config": _touch(tmp_path / "dataset.toml"),
+            "dit": _touch(tmp_path / "dit.safetensors"),
+            "vae": _touch(tmp_path / "vae.safetensors"),
+            "text_encoder": _touch(tmp_path / "text_encoder.safetensors"),
+            "output_dir": str(tmp_path / "output"),
+            "output_name": "edit-print",
+            "blocks_to_swap": 0,
+            "block_swap_h2d_only": False,
+        }
+    )
+    printed = []
+    monkeypatch.setattr(
+        modern_image_lora_gui,
+        "print_command_and_toml",
+        lambda command, config_path: printed.append((command, config_path)),
+    )
+
+    modern_image_lora_gui.train_modern_image_model(
+        "krea2", True, True, list(values.items())
+    )
+
+    assert [Path(command[1]).name for command, _config in printed[:2]] == [
+        "krea2_edit_cache_latents.py",
+        "krea2_edit_cache_text_encoder_outputs.py",
+    ]
+    assert any(Path(str(part)).name == "krea2_edit_train_network.py" for part in printed[2][0])
 
 
 @pytest.mark.parametrize(

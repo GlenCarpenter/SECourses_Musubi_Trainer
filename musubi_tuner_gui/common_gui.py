@@ -58,6 +58,52 @@ PORTABLE_MODEL_PATH_KEYS = frozenset(
     }
 )
 
+_WINDOWS_PATH_START = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+_TOML_BASIC_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def _normalize_windows_separators(value: str) -> str:
+    if value.startswith("\\\\"):
+        return "//" + re.sub(r"\\+", "/", value.lstrip("\\"))
+    return re.sub(r"\\+", "/", value)
+
+
+def sanitize_toml_windows_paths(content: str) -> str:
+    """Normalize separators in TOML basic strings that contain Windows paths."""
+
+    def sanitize_match(match: re.Match) -> str:
+        value = match.group(0)[1:-1]
+        if not _WINDOWS_PATH_START.match(value):
+            return match.group(0)
+        return f'"{_normalize_windows_separators(value)}"'
+
+    return _TOML_BASIC_STRING.sub(sanitize_match, content)
+
+
+def load_toml_sanitized(file_or_path):
+    """Load TOML after neutralizing backslash escapes in Windows path values."""
+    if hasattr(file_or_path, "read"):
+        content = file_or_path.read()
+    else:
+        with open(file_or_path, "r", encoding="utf-8-sig") as handle:
+            content = handle.read()
+    return toml.loads(sanitize_toml_windows_paths(content))
+
+
+def normalize_toml_path_values(value):
+    """Recursively normalize Windows path strings before serializing TOML."""
+    if isinstance(value, str):
+        if _WINDOWS_PATH_START.match(value):
+            return _normalize_windows_separators(value)
+        return value
+    if isinstance(value, dict):
+        return {key: normalize_toml_path_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [normalize_toml_path_values(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(normalize_toml_path_values(item) for item in value)
+    return value
+
 
 def _training_model_directories() -> list[Path]:
     """Return explicitly configured and distribution-local model folders."""
@@ -1938,6 +1984,7 @@ def SaveConfigFile(
         os.makedirs(folder_path)
         log.info(f"Creating folder {folder_path} for the configuration file...")
 
+    variables = normalize_toml_path_values(variables)
     with open(file_path, "w", encoding="utf-8") as file:
         toml.dump(variables, file)
 
@@ -2345,6 +2392,7 @@ def SaveConfigFileToRun(
 
     _normalize_logging_fields_for_run_config(variables)
 
+    variables = normalize_toml_path_values(variables)
     with open(file_path, "w", encoding="utf-8") as file:
         toml.dump(variables, file)
 
@@ -2482,7 +2530,7 @@ def validate_toml_file(file_path: str) -> bool:
         return False
 
     try:
-        toml.load(file_path)
+        load_toml_sanitized(file_path)
     except:
         log.error(f"{msg} FAILED: is not a valid toml file.")
         return False

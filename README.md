@@ -1,6 +1,6 @@
 # SECourses Musubi Trainer V34 — The Only App You Need to Train Every Major Open Model: Qwen Image, Wan 2.1 / 2.2, FLUX 2, FLUX Klein, Z-Image, Ideogram 4, Krea 2, LTX 2.3 and MiniMax H3 Video + Audio
 
-**One app. Fifteen tabs. State-of-the-art open image and video training, including joint audio — Full Fine-Tuning / DreamBooth for supported image families and LoRA across image and video families — with 1-click installers, researched ready-to-use presets, and speed the stock trainer simply cannot reach.**
+**One app. Sixteen tabs. State-of-the-art open image and video training, including joint audio — Full Fine-Tuning / DreamBooth for supported image families and LoRA across image and video families — with 1-click installers, researched ready-to-use presets, and speed the stock trainer simply cannot reach.**
 
 - **App Download Link (Patreon) : https://www.patreon.com/posts/secourses-musubi-137551634**
 - **Latest Zip File : [SECourses_Musubi_Trainer_v34.zip](https://www.patreon.com/file?h=137551634&m=717993383)**
@@ -143,7 +143,7 @@ Everything in this post ships as one zip file. Extract it and you get the 1-clic
 
 ---
 
-## The Grand Tour — All 15 Tabs, With Real 4K Screenshots
+## The Grand Tour — All 16 Tabs, With Real 4K Screenshots
 
 ### 1 — Qwen Image Training
 
@@ -356,31 +356,35 @@ Turn your trained checkpoints (or any base model) into deploy-ready quants: FP8 
 
 ![Model Quantizer tab](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/Nu2G3yw12oAN381kmomDw.png)
 
-### 11 — LoRA Extractor
+### 11 — Krea 2 Checkpoint Merger
+
+Blend two complete **Krea 2 ConvRot INT8 DiT checkpoints** at any ratio, such as 70% checkpoint A and 30% checkpoint B. The merger validates that both checkpoints have matching architectures and quantization layouts, dequantizes one layer at a time, blends in FP32, requantizes with each layer's original ConvRot group size, and saves a portable ComfyUI / SwarmUI-compatible INT8 checkpoint. Streaming input and output keep memory bounded to one layer, while CPU and CUDA modes, overwrite protection and cancellation are built in.
+
+### 12 — LoRA Extractor
 
 Extract a small, distributable LoRA out of any full fine-tuned / DreamBooth checkpoint — keep the full-quality fine-tune for yourself, ship the LoRA. Single-file and recursive batch extraction, configurable SVD rank and clamp quantile, device and precision selection, metadata preservation, and progress with cancellation:
 
 ![LoRA Extractor tab](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/ZGxWs5r8jp7GePJ8IhvTW.png)
 
-### 12 — LoRA Merger
+### 13 — LoRA Merger
 
-Merge up to **three LoRAs simultaneously**, each with its own independent multiplier — LoRA into LoRA, or bake LoRAs directly into a DiT base checkpoint. Single and recursive batch modes, model-specific profiles for Qwen, Wan, SkyReels and custom architectures, plus device and output-dtype controls:
+Merge up to **three LoRAs simultaneously**, each with its own independent multiplier — LoRA into LoRA, or bake LoRAs directly into a DiT base checkpoint. Single and recursive batch modes, model-specific profiles for Qwen, Krea 2, Wan, SkyReels and custom architectures, plus device and output-dtype controls. The Krea 2 profile can bake directly into a pre-quantized ConvRot INT8 checkpoint and saves a portable ConvRot INT8 result:
 
 ![LoRA Merger tab](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/GXS5xNRKYsH104YW5yfzq.png)
 
-### 13 — LoRA Converter
+### 14 — LoRA Converter
 
 Move your LoRAs between ecosystems without touching a script: **six bidirectional conversion profiles** covering Diffusers, Musubi, ComfyUI and SwarmUI formats, dedicated HunyuanVideo 1.5 and Z-Image conversions, single-file and recursive folder batch processing:
 
 ![LoRA Converter tab](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/G71vAxjHtm8xuqgj4FU4t.png)
 
-### 14 — Image Preprocessing
+### 15 — Image Preprocessing
 
 A unique safety net: this tool runs your dataset through the **actual Musubi Tuner training code** and shows you exactly what the trainer will see — final resolutions, aspect ratios, bucketing decisions. It also catches the classic silent killer: EXIF-rotated images that would train sideways. Preview first, never waste a training run again.
 
 ![Image Preprocessing tab](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/STa9YIEOYrDA1PBZe6YmU.png)
 
-### 15 — Version History
+### 16 — Version History
 
 The full changelog of all 44 releases through V34 now lives **inside the app** — every version in its own collapsible section with an Open / Close All button, so you always know exactly what changed and when. This app is in constant, active development: what you subscribe to today keeps getting better every single week.
 

@@ -1,5 +1,5 @@
 import toml
-from .common_gui import scriptdir
+from .common_gui import load_toml_sanitized, normalize_toml_path_values, scriptdir
 from .custom_logging import setup_logging
 
 # Set up logging
@@ -27,7 +27,7 @@ class GUIConfig:
         try:
             # Attempt to load the TOML configuration file from the specified directory.
             with open(config_file_path, "r", encoding="utf-8-sig") as config_file:
-                config = toml.load(config_file)
+                config = load_toml_sanitized(config_file)
             log.debug(f"Loaded configuration from {config_file_path}")
         except FileNotFoundError:
             # If the config file is not found, initialize `config` as an empty dictionary to handle missing configurations gracefully.
@@ -47,7 +47,7 @@ class GUIConfig:
         """
         # Write the configuration data to the TOML file
         with open(f"{config_file_path}", "w", encoding="utf-8") as f:
-            toml.dump(config, f)
+            toml.dump(normalize_toml_path_values(config), f)
 
     def get(self, key: str, default=None):
         """

@@ -18,6 +18,7 @@ from .common_gui import (
     get_folder_path,
     get_saveasfilename_path,
     get_file_path_or_save_as,
+    load_toml_sanitized,
     utf8_subprocess_options,
     save_executed_script,
     generate_script_content,
@@ -4101,7 +4102,7 @@ def model_quantizer_tab(headless: bool, config: GUIConfig) -> None:
         if not os.path.isfile(file_path):
             return [original_file_path, "Config file not found"] + [gr.update() for _ in settings_components]
         try:
-            data = toml.load(file_path)
+            data = load_toml_sanitized(file_path)
         except Exception as exc:
             return [original_file_path, f"Failed to load: {exc}"] + [gr.update() for _ in settings_components]
         flat = _flatten_dict(data)

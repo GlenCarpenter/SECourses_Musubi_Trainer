@@ -92,3 +92,129 @@ This fork's `trainer_base.py` resolves the `--sdpa` flag through `resolve_sdpa_b
 ### Regression check
 
 Before finishing a new trainer: run a real "Start Training" (or at minimum construct the model with `attn_mode="flash_auto"`) on a machine where `resolve_sdpa_backend()` returns `"flash_auto"`, not just `pytest` — the crash only appears at real transformer load time.
+
+---
+
+## Guardrail 4: Canonical checkpoint keys in model mergers
+
+### Rule
+
+- Compare checkpoint structures through canonical model keys, not raw safetensors keys.
+- Normalize known wrapper prefixes such as `model.diffusion_model.` and `diffusion_model.` before compatibility checks.
+- Treat `.scale_weight` and `.weight_scale` as equivalent storage names where the model format supports both.
+- Do not require both inputs to duplicate `.comfy_quant` controls. One-sided controls are valid only when the other checkpoint has the matching INT8 weight and FP32 scale tensors for that canonical layer.
+- Preserve checkpoint A's naming convention in the merged output and emit a control tensor for every merged quantized layer.
+
+### Why this exists
+
+The Krea 2 checkpoint merger originally compared raw key sets. Two compatible ConvRot INT8 checkpoints were rejected when one used native Krea keys with per-layer `.comfy_quant` tensors and the other used ComfyUI's `model.diffusion_model.` wrapper without duplicating every control tensor.
+
+### Required implementation pattern
+
+- Build collision-checked canonical-to-raw key maps for both inputs before comparing layouts.
+- Compare structural tensors after excluding optional quantization control tensors.
+- Resolve each quantized layer's settings from either input, reject conflicting settings, and still require compatible INT8 weight/FP32 scale pairs on both sides.
+- Stream output under checkpoint A's raw keys so normalization does not silently change the selected output ecosystem.
+
+### Regression check
+
+- Merge an unprefixed checkpoint containing `.comfy_quant` controls with an otherwise identical `model.diffusion_model.`-prefixed checkpoint that omits those controls.
+- Confirm the merge succeeds, ordinary tensors align by canonical key, and the output uses checkpoint A's namespace with a complete ConvRot control triple for every quantized layer.
+- Confirm genuinely different canonical tensor layouts still fail before output is installed.
+
+---
+
+## Guardrail 5: Register new architectures for checkpoint metadata
+
+### Rule
+
+- Add every runnable architecture ID to `musubi-tuner/src/musubi_tuner/utils/sai_model_spec.py` before its trainer can save checkpoints.
+- When a new mode produces adapters for an existing base model, reuse that base model's ModelSpec architecture and implementation instead of inventing an incompatible adapter identity.
+
+### Why this exists
+
+The first real Krea 2 Edit run completed model loading, forward, backward, and the optimizer step, then failed while saving with `ValueError: Unknown architecture: kr2e`. Unit tests of the training step did not exercise shared checkpoint metadata generation.
+
+### Required implementation pattern
+
+- Import the new short architecture ID in `sai_model_spec.py`.
+- Add it to both the architecture/implementation mapping and the default-resolution mapping.
+- Add a regression test that calls `build_metadata()` with the trainer's `architecture` property and checks the resulting ModelSpec identity.
+
+### Regression check
+
+- Complete at least one real or synthetic checkpoint save, reopen the safetensors file, and verify `modelspec.architecture`, `modelspec.implementation`, and the expected network metadata.
+
+---
+
+## Guardrail 6: Windows-safe backend help output
+
+### Rule
+
+- New executable backend entry points that use the shared bilingual parser must call `configure_console_output_for_help()` before `parse_args()`.
+
+### Why this exists
+
+The initial Krea 2 Edit trainer entry point crashed on Windows when invoked with `--help` because a CP1252 console could not encode Japanese help text. This prevented basic CLI discovery before any training work began.
+
+### Required implementation pattern
+
+- Import `configure_console_output_for_help` from `musubi_tuner.training.runtime_utils`.
+- Call it at the start of `main()`, before constructing or parsing the argument parser.
+
+### Regression check
+
+- Run the new script with `--help` from Windows PowerShell and confirm it exits successfully.
+
+---
+
+## Guardrail 7: Keep task mode separate from training mode
+
+### Rule
+
+- A workflow selector such as Text-to-Image / Image Edit must be persisted independently from the LoRA / Full Fine-Tuning selector.
+- Use the task mode to choose the dataset contract and cache/trainer entry points; use the training mode only to choose adapter versus full-model optimization.
+- If a task is LoRA-only, force LoRA in normalization as well as in the UI and restore task-specific panel visibility after Load/Open.
+
+### Why this exists
+
+Krea 2 Image Edit shares the Krea model and LoRA implementation with Text-to-Image, but uses a paired dataset and three different backend scripts. Treating Image Edit as another training mode would entangle script selection with the existing full-finetune round trip and could silently launch the plain Krea trainer after loading a saved edit run.
+
+### Required implementation pattern
+
+- Persist a dedicated task key in hand-saved and runtime TOMLs.
+- Validate unsupported task/training-mode combinations before model loading.
+- Select latent cache, text cache, and trainer scripts from the task key as one coherent set.
+- Chain task-specific visibility synchronization from both Open and Load events because programmatic Gradio updates do not trigger `.change()` handlers.
+- Clear a generated dataset path when the user changes task so a TOML from the previous dataset contract is not silently reused.
+
+### Regression check
+
+- Print an edit workflow and confirm all three commands use edit entry points.
+- Reload its runtime TOML and confirm Image Edit, LoRA, and the edit-only controls are restored.
+- Switch back to Text-to-Image and confirm the standard Krea scripts and full-finetune option remain available.
+
+---
+
+## Guardrail 8: Keep GUI bookkeeping out of dataset fallbacks
+
+### Rule
+
+- When a workflow generates a dataset TOML, that file must remain authoritative for task-specific dataset fields.
+- GUI bookkeeping persisted in the runtime TOML must not also reach dataset constructors through argparse fallback when the generated dataset TOML owns the corresponding value.
+- Preserve bookkeeping needed for GUI Load/Open round trips; exclude it at the dataset blueprint boundary rather than deleting it from runtime persistence.
+
+### Why this exists
+
+Krea 2 Image Edit persists `reference_directory` for GUI round trips and writes the ordered dataset contract as `reference_directories` in its generated dataset TOML. The dataset blueprint previously treated every non-null runtime argument as a fallback, so training supplied both fields to `ImageDataset` and failed with `ValueError: Specify reference_directory or reference_directories, not both`. Cache generation succeeded because the collision appeared only when the training process rebuilt the dataset blueprint.
+
+### Required implementation pattern
+
+- Identify GUI-only or superseded runtime fields before constructing `argparse_config` in `BlueprintGenerator.generate()`.
+- Exclude those fields only for the architecture or workflow whose generated dataset TOML replaces them; do not change fallback behavior globally.
+- Keep ordered or multi-value dataset contracts in the dataset TOML, including Krea 2 Edit's `reference_directories`.
+
+### Regression check
+
+- Generate a blueprint from a dataset config containing the authoritative plural or structured field and a runtime namespace containing its GUI bookkeeping counterpart.
+- Confirm the blueprint keeps the dataset-config value, leaves the conflicting fallback field unset, and can construct the dataset without a mutual-exclusion error.

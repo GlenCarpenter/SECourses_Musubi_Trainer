@@ -8,6 +8,7 @@ CHANGELOG_ENTRIES = [
         """
 **🎬🔊 Full MiniMax H3 text-to-video-with-audio (T2VA), first/last-frame (FL2VA), and reference-to-video (Ref2VA) LoRA training.**
 
+- **New "Krea 2 Checkpoint Merger" tab**: blend two complete ConvRot INT8 Krea 2 DiT checkpoints at any ratio. The memory-bounded workflow validates matching tensor and quantization layouts, dequantizes one layer at a time, blends in FP32, requantizes with the original per-layer ConvRot group size, and writes a portable ComfyUI / SwarmUI-compatible checkpoint with CPU/CUDA modes and cancellation.
 - **New "MiniMax H3 Video Training" tab**: complete pipeline from dataset TOML generation (17n+5 frame rule, 24 fps timestamp normalization, and the hard batch-size-1 rule handled automatically) through video+audio VAE latent caching and Qwen3-VL 32B text-embedding caching to LoRA training with `networks.lora_minimax_h3` — all chained from one Start Training button.
 - **Joint audio supervision**: clips with a real audio track (or a same-stem `.wav` sidecar) train the audio stream too; silent clips are never supervised toward silence. The cache reports the supervised-audio fraction, and `video_only` / `audio_loss_weight` controls are exposed.
 - **Guidance-distillation countermeasure enabled by default** (scale 4.0, sigma-min gate 0.15): H3 checkpoints are CFG-distilled and plain flow training slowly washes them out; the guidance loss re-anchors the target in the distilled space. The required uncond probe cache is generated automatically during text-encoder caching — nothing to configure.

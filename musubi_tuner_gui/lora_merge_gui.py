@@ -34,6 +34,7 @@ DEFAULT_MERGE_MODE_LABEL = MERGE_MODE_LABELS["lora_to_lora"]
 
 MODEL_PROFILES: List[Dict[str, object]] = [
     {"label": "Qwen Image (16 channels)", "type": "qwen", "channels": 16},
+    {"label": "Krea 2 ConvRot INT8 (16 channels)", "type": "krea2", "channels": 16},
     {"label": "Skyreels / DiT-I2V (32 channels)", "type": "hunyuan", "channels": 32},
     {"label": "Wan / VideoXL (48 channels)", "type": "hunyuan", "channels": 48},
     {"label": "Custom (manual channels)", "type": "custom", "channels": 16},

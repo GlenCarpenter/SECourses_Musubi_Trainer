@@ -12,6 +12,7 @@ from .common_gui import (
     get_folder_path,
     get_saveasfile_path,
     get_file_path_or_save_as,
+    load_toml_sanitized,
     SaveConfigFile,
 )
 from .custom_logging import setup_logging
@@ -1037,10 +1038,8 @@ class ImageCaptioningTab:
             return "", False, 1280, 1024, "", "", "", True, True, "", "", "text", "", "", ".txt", False, False, False, False, True, 0.7, 50, 0.95, 1.05, False, error_msg
         
         try:
-            import toml
-            
             with open(config_file_path, "r", encoding="utf-8") as f:
-                config_data = toml.load(f)
+                config_data = load_toml_sanitized(f)
             
             captioning_config = config_data.get("image_captioning", {})
             

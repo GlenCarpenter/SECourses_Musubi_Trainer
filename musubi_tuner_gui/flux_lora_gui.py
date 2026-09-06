@@ -28,6 +28,7 @@ from .common_gui import (
     get_file_path_or_save_as,
     get_folder_path,
     list_files,
+    load_toml_sanitized,
     normalize_path,
     print_command_and_toml,
     resolve_portable_model_value,
@@ -265,7 +266,7 @@ def open_flux_configuration(ask_for_file, file_path, parameters):
 
     try:
         with open(file_path, "r", encoding="utf-8-sig") as f:
-            data = toml.load(f)
+            data = load_toml_sanitized(f)
     except Exception as e:
         msg = f"Failed to load configuration: {e}"
         log.error(msg)

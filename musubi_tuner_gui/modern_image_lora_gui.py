@@ -12,7 +12,6 @@ from datetime import datetime
 from functools import partial
 
 import gradio as gr
-import toml
 
 from .class_accelerate_launch import AccelerateLaunch
 from .class_advanced_training import AdvancedTraining
@@ -31,6 +30,7 @@ from .common_gui import (
     get_file_path,
     get_file_path_or_save_as,
     get_folder_path,
+    load_toml_sanitized,
     print_command_and_toml,
     resolve_portable_model_value,
     run_cmd_advanced_training,
@@ -58,6 +58,14 @@ from .full_finetune_gui import (
 from .optimizer_catalog import validate_automagic_configuration
 
 log = setup_logging()
+
+KREA2_TEXT_TO_IMAGE_TASK = "Text-to-Image"
+KREA2_IMAGE_EDIT_TASK = "Image Edit"
+KREA2_TASK_CHOICES = [KREA2_TEXT_TO_IMAGE_TASK, KREA2_IMAGE_EDIT_TASK]
+KREA2_EDIT_FIT_PROTOCOL = "1.0.0"
+KREA2_EDIT_TEXT_CACHE_GENERATE = "Generate fixed cache"
+KREA2_EDIT_TEXT_CACHE_REUSE = "Reuse existing fixed cache"
+KREA2_EDIT_TEXT_CACHE_POLICIES = [KREA2_EDIT_TEXT_CACHE_GENERATE, KREA2_EDIT_TEXT_CACHE_REUSE]
 
 
 @dataclass(frozen=True)
@@ -141,6 +149,7 @@ MODERN_IMAGE_PARAM_KEYS = [
     "additional_parameters",
     "debug_mode",
     "training_mode",
+    "krea2_task",
     # Dataset
     "dataset_config_mode",
     "dataset_config",
@@ -155,6 +164,11 @@ MODERN_IMAGE_PARAM_KEYS = [
     "dataset_bucket_no_upscale",
     "dataset_cache_directory",
     "generated_toml_path",
+    "reference_directory",
+    "reference_directory_2",
+    "edit_fit_protocol",
+    "grounding_pixels",
+    "edit_text_cache_policy",
     # Model
     "dit",
     "vae",
@@ -343,6 +357,12 @@ def get_architecture(key: str) -> ModernImageArchitecture:
         raise ValueError(f"Unknown modern image architecture: {key}") from exc
 
 
+def resolve_krea2_task_state(spec: ModernImageArchitecture, task: object, training_mode: object) -> tuple[bool, str, bool]:
+    image_edit = spec.is_krea and task == KREA2_IMAGE_EDIT_TASK
+    mode = LORA_TRAINING_MODE if image_edit else normalize_training_mode(training_mode)
+    return image_edit, mode, not image_edit
+
+
 def _trainer_script_path(filename: str) -> str:
     return os.path.normpath(os.path.join(scriptdir, "musubi-tuner", "src", "musubi_tuner", filename))
 
@@ -412,6 +432,25 @@ def _normalize_modern_parameters(
     validate_paths: bool = True,
 ) -> tuple[dict, list[tuple[str, object]]]:
     param_dict, parameters, full_finetune = normalize_image_training_parameters(parameters)
+    image_edit = spec.is_krea and param_dict.get("krea2_task") == KREA2_IMAGE_EDIT_TASK
+    if image_edit and full_finetune:
+        raise ValueError("Krea 2 Image Edit currently supports LoRA training only.")
+    if image_edit:
+        grounding_pixels = int(param_dict.get("grounding_pixels") or 768)
+        if not 384 <= grounding_pixels <= 768:
+            raise ValueError("Krea 2 Image Edit grounding pixels must be between 384 and 768.")
+        param_dict["grounding_pixels"] = grounding_pixels
+        parameters = _replace_parameter(parameters, "grounding_pixels", grounding_pixels)
+        if str(param_dict.get("edit_fit_protocol") or KREA2_EDIT_FIT_PROTOCOL) != KREA2_EDIT_FIT_PROTOCOL:
+            raise ValueError(f"Krea 2 Image Edit supports fit protocol '{KREA2_EDIT_FIT_PROTOCOL}' only.")
+        if str(param_dict.get("sample_prompts") or "").strip():
+            raise ValueError("Krea 2 Image Edit does not support training-time sample previews.")
+        cache_policy = str(param_dict.get("edit_text_cache_policy") or KREA2_EDIT_TEXT_CACHE_GENERATE)
+        if cache_policy not in KREA2_EDIT_TEXT_CACHE_POLICIES:
+            raise ValueError(f"Unknown Krea 2 Image Edit text-cache policy: {cache_policy}")
+        run_text_cache = cache_policy == KREA2_EDIT_TEXT_CACHE_GENERATE
+        param_dict["cache_text_encoder_outputs"] = run_text_cache
+        parameters = _replace_parameter(parameters, "cache_text_encoder_outputs", run_text_cache)
     if not full_finetune:
         param_dict["network_module"] = spec.network_module
         parameters = _replace_parameter(parameters, "network_module", spec.network_module)
@@ -605,12 +644,15 @@ def build_modern_cache_commands(
     python_cmd = python_cmd or sys.executable
     dataset_config = str(param_dict["dataset_config"])
     gpu_ids = param_dict.get("gpu_ids")
+    image_edit = spec.is_krea and param_dict.get("krea2_task") == KREA2_IMAGE_EDIT_TASK
+    latent_cache_script = "krea2_edit_cache_latents.py" if image_edit else spec.latent_cache_script
+    text_cache_script = "krea2_edit_cache_text_encoder_outputs.py" if image_edit else spec.text_cache_script
 
     latent_command = None
     if bool(param_dict.get("cache_latents", True)):
         latent_command = [
             python_cmd,
-            _trainer_script_path(spec.latent_cache_script),
+            _trainer_script_path(latent_cache_script),
             "--dataset_config",
             dataset_config,
             "--vae",
@@ -636,7 +678,7 @@ def build_modern_cache_commands(
     if bool(param_dict.get("cache_text_encoder_outputs", True)):
         text_command = [
             python_cmd,
-            _trainer_script_path(spec.text_cache_script),
+            _trainer_script_path(text_cache_script),
             "--dataset_config",
             dataset_config,
             "--text_encoder",
@@ -667,6 +709,8 @@ def build_modern_cache_commands(
             text_command.extend(
                 ["--text_encoder_dtype", str(param_dict["caching_teo_text_encoder_dtype"])]
             )
+        if image_edit:
+            text_command.extend(["--grounding_pixels", str(param_dict["grounding_pixels"])])
 
     return latent_command, text_command
 
@@ -674,6 +718,7 @@ def build_modern_cache_commands(
 def _run_config_exclusions(spec: ModernImageArchitecture, parameters: list[tuple[str, object]]) -> list[str]:
     param_dict = dict(parameters)
     full_finetune = is_full_fine_tuning(param_dict.get("training_mode"))
+    image_edit = spec.is_krea and param_dict.get("krea2_task") == KREA2_IMAGE_EDIT_TASK
     exclusions = {
         "additional_parameters",
         "debug_mode",
@@ -709,6 +754,8 @@ def _run_config_exclusions(spec: ModernImageArchitecture, parameters: list[tuple
         "sample_negative_prompt",
         "sample_cfg_scale",
     }
+    if image_edit:
+        exclusions.discard("parent_folder_path")
     exclusions.update(training_mode_runtime_exclusions(param_dict.get("training_mode")))
     exclusions.update(
         key
@@ -798,7 +845,8 @@ def prepare_modern_image_workflow(
         mixed_precision=param_dict.get("mixed_precision"),
         extra_accelerate_launch_args=param_dict.get("extra_accelerate_launch_args"),
     )
-    train_script = spec.full_train_script if full_finetune else spec.train_script
+    image_edit = spec.is_krea and param_dict.get("krea2_task") == KREA2_IMAGE_EDIT_TASK
+    train_script = "krea2_edit_train_network.py" if image_edit else spec.full_train_script if full_finetune else spec.train_script
     train_command.extend([_trainer_script_path(train_script), "--config_file", config_path])
 
     additional = str(param_dict.get("additional_parameters") or "").strip()
@@ -860,6 +908,62 @@ def _create_dataset_config(
     return os.path.abspath(path), messages
 
 
+def _create_krea2_edit_dataset_config(
+    *,
+    target_directory: object,
+    reference_directory: object,
+    reference_directory_2: object,
+    resolution_width: object,
+    resolution_height: object,
+    caption_extension: object,
+    enable_bucket: object,
+    bucket_no_upscale: object,
+    cache_directory: object,
+    output_dir: object,
+) -> tuple[str, list[str]]:
+    target = str(target_directory or "").strip()
+    references = [
+        str(path).strip()
+        for path in (reference_directory, reference_directory_2)
+        if str(path or "").strip()
+    ]
+    if not target or not os.path.isdir(target):
+        raise ValueError(f"Target image directory does not exist: {target or '(empty)'}")
+    if not 1 <= len(references) <= 2:
+        raise ValueError("Krea 2 Image Edit requires one or two reference directories.")
+    missing = [path for path in references if not os.path.isdir(path)]
+    if missing:
+        raise ValueError(f"Reference image directory does not exist: {missing[0]}")
+
+    target = os.path.abspath(target)
+    references = [os.path.abspath(path) for path in references]
+    cache_name = str(cache_directory or "cache_dir").strip() or "cache_dir"
+    cache_path = cache_name if os.path.isabs(cache_name) else os.path.join(target, cache_name)
+    config = {
+        "general": {
+            "resolution": [int(resolution_width), int(resolution_height)],
+            "caption_extension": str(caption_extension or ".txt"),
+            "batch_size": 1,
+            "enable_bucket": bool(enable_bucket),
+            "bucket_no_upscale": bool(bucket_no_upscale),
+        },
+        "datasets": [
+            {
+                "image_directory": target,
+                "reference_directories": references,
+                "cache_directory": os.path.abspath(cache_path),
+                "num_repeats": 1,
+            }
+        ],
+    }
+    save_dir = str(output_dir or "").strip() or target
+    os.makedirs(save_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(save_dir, f"krea2_edit_dataset_{timestamp}.toml")
+    save_dataset_config(config, path)
+    return os.path.abspath(path), [f"Saved paired Krea 2 Image Edit dataset TOML: {path}"]
+
+
 def generate_modern_dataset_toml(
     spec_key: str,
     parent_folder_path,
@@ -873,23 +977,40 @@ def generate_modern_dataset_toml(
     dataset_bucket_no_upscale,
     dataset_cache_directory,
     output_dir,
+    krea2_task=KREA2_TEXT_TO_IMAGE_TASK,
+    reference_directory="",
+    reference_directory_2="",
 ):
     spec = get_architecture(spec_key)
     try:
-        path, messages = _create_dataset_config(
-            spec,
-            parent_folder_path=parent_folder_path,
-            resolution_width=dataset_resolution_width,
-            resolution_height=dataset_resolution_height,
-            caption_extension=dataset_caption_extension,
-            create_missing_captions=create_missing_captions,
-            caption_strategy=caption_strategy,
-            batch_size=dataset_batch_size,
-            enable_bucket=dataset_enable_bucket,
-            bucket_no_upscale=dataset_bucket_no_upscale,
-            cache_directory=dataset_cache_directory,
-            output_dir=output_dir,
-        )
+        if spec.is_krea and krea2_task == KREA2_IMAGE_EDIT_TASK:
+            path, messages = _create_krea2_edit_dataset_config(
+                target_directory=parent_folder_path,
+                reference_directory=reference_directory,
+                reference_directory_2=reference_directory_2,
+                resolution_width=dataset_resolution_width,
+                resolution_height=dataset_resolution_height,
+                caption_extension=dataset_caption_extension,
+                enable_bucket=dataset_enable_bucket,
+                bucket_no_upscale=dataset_bucket_no_upscale,
+                cache_directory=dataset_cache_directory,
+                output_dir=output_dir,
+            )
+        else:
+            path, messages = _create_dataset_config(
+                spec,
+                parent_folder_path=parent_folder_path,
+                resolution_width=dataset_resolution_width,
+                resolution_height=dataset_resolution_height,
+                caption_extension=dataset_caption_extension,
+                create_missing_captions=create_missing_captions,
+                caption_strategy=caption_strategy,
+                batch_size=dataset_batch_size,
+                enable_bucket=dataset_enable_bucket,
+                bucket_no_upscale=bucket_no_upscale,
+                cache_directory=dataset_cache_directory,
+                output_dir=output_dir,
+            )
         return path, path, "\n".join(messages)
     except Exception as exc:
         message = f"Failed to generate dataset TOML: {exc}"
@@ -1009,6 +1130,8 @@ def _config_value_for_component(key: str, value: object, default: object, spec: 
         # Infer from the file itself instead of silently keeping whatever the
         # GUI already had on screen.
         if data is not None:
+            if spec.is_krea and data.get("krea2_task") == KREA2_IMAGE_EDIT_TASK:
+                return LORA_TRAINING_MODE
             return infer_training_mode_from_loaded_config(data)
         return normalize_training_mode(value)
     if key == "network_module":
@@ -1051,7 +1174,7 @@ def open_modern_configuration(
 
     try:
         with open(file_path, "r", encoding="utf-8-sig") as handle:
-            data = toml.load(handle)
+            data = load_toml_sanitized(handle)
         values = []
         for key, default in parameters:
             value = resolve_portable_model_value(key, data.get(key, default))
@@ -1111,20 +1234,34 @@ def train_modern_image_model(
     if str(param_dict.get("dataset_config_mode") or "") == "Generate from Folder Structure":
         generated = str(param_dict.get("generated_toml_path") or "").strip()
         if not generated or not os.path.isfile(generated):
-            generated, _ = _create_dataset_config(
-                spec,
-                parent_folder_path=param_dict.get("parent_folder_path"),
-                resolution_width=param_dict.get("dataset_resolution_width"),
-                resolution_height=param_dict.get("dataset_resolution_height"),
-                caption_extension=param_dict.get("dataset_caption_extension"),
-                create_missing_captions=param_dict.get("create_missing_captions"),
-                caption_strategy=param_dict.get("caption_strategy"),
-                batch_size=param_dict.get("dataset_batch_size"),
-                enable_bucket=param_dict.get("dataset_enable_bucket"),
-                bucket_no_upscale=param_dict.get("dataset_bucket_no_upscale"),
-                cache_directory=param_dict.get("dataset_cache_directory"),
-                output_dir=param_dict.get("output_dir"),
-            )
+            if spec.is_krea and param_dict.get("krea2_task") == KREA2_IMAGE_EDIT_TASK:
+                generated, _ = _create_krea2_edit_dataset_config(
+                    target_directory=param_dict.get("parent_folder_path"),
+                    reference_directory=param_dict.get("reference_directory"),
+                    reference_directory_2=param_dict.get("reference_directory_2"),
+                    resolution_width=param_dict.get("dataset_resolution_width"),
+                    resolution_height=param_dict.get("dataset_resolution_height"),
+                    caption_extension=param_dict.get("dataset_caption_extension"),
+                    enable_bucket=param_dict.get("dataset_enable_bucket"),
+                    bucket_no_upscale=param_dict.get("dataset_bucket_no_upscale"),
+                    cache_directory=param_dict.get("dataset_cache_directory"),
+                    output_dir=param_dict.get("output_dir"),
+                )
+            else:
+                generated, _ = _create_dataset_config(
+                    spec,
+                    parent_folder_path=param_dict.get("parent_folder_path"),
+                    resolution_width=param_dict.get("dataset_resolution_width"),
+                    resolution_height=param_dict.get("dataset_resolution_height"),
+                    caption_extension=param_dict.get("dataset_caption_extension"),
+                    create_missing_captions=param_dict.get("create_missing_captions"),
+                    caption_strategy=param_dict.get("caption_strategy"),
+                    batch_size=param_dict.get("dataset_batch_size"),
+                    enable_bucket=param_dict.get("dataset_enable_bucket"),
+                    bucket_no_upscale=param_dict.get("dataset_bucket_no_upscale"),
+                    cache_directory=param_dict.get("dataset_cache_directory"),
+                    output_dir=param_dict.get("output_dir"),
+                )
         param_dict["dataset_config"] = generated
         parameters = _replace_parameter(parameters, "dataset_config", generated)
         parameters = _replace_parameter(parameters, "generated_toml_path", generated)
@@ -1231,6 +1368,7 @@ def _architecture_defaults(spec: ModernImageArchitecture) -> dict[str, object]:
         "dynamo_use_dynamic": False,
         "extra_accelerate_launch_args": "",
         "training_mode": LORA_TRAINING_MODE,
+        "krea2_task": KREA2_TEXT_TO_IMAGE_TASK,
         "dataset_config_mode": "Generate from Folder Structure",
         "dataset_resolution_width": 1024,
         "dataset_resolution_height": 1024,
@@ -1241,6 +1379,11 @@ def _architecture_defaults(spec: ModernImageArchitecture) -> dict[str, object]:
         "dataset_enable_bucket": True,
         "dataset_bucket_no_upscale": False,
         "dataset_cache_directory": "cache_dir",
+        "reference_directory": "",
+        "reference_directory_2": "",
+        "edit_fit_protocol": KREA2_EDIT_FIT_PROTOCOL,
+        "grounding_pixels": 768,
+        "edit_text_cache_policy": KREA2_EDIT_TEXT_CACHE_GENERATE,
         "dit_dtype": "bfloat16",
         "vae_dtype": "bfloat16",
         "blocks_to_swap": spec.max_blocks_to_swap,
@@ -1369,7 +1512,11 @@ def _prepare_config(spec: ModernImageArchitecture, config) -> GUIConfig:
 def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConfig | dict = {}):
     spec = get_architecture(spec_key)
     config = _prepare_config(spec, config)
+    initial_krea2_task = config.get("krea2_task", KREA2_TEXT_TO_IMAGE_TASK)
+    initial_image_edit = spec.is_krea and initial_krea2_task == KREA2_IMAGE_EDIT_TASK
     initial_training_mode = normalize_training_mode(config.get("training_mode", LORA_TRAINING_MODE))
+    if initial_image_edit:
+        initial_training_mode = LORA_TRAINING_MODE
     initial_full_finetune = is_full_fine_tuning(initial_training_mode)
 
     dummy_true = gr.Checkbox(value=True, visible=False)
@@ -1384,6 +1531,14 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
         choices=TRAINING_MODE_CHOICES,
         value=initial_training_mode,
         info="LoRA trains adapters; Full Fine-Tuning updates the complete DiT and needs substantially more memory.",
+        interactive=not initial_image_edit,
+    )
+    krea2_task = gr.Radio(
+        label="Krea 2 Task",
+        choices=KREA2_TASK_CHOICES,
+        value=initial_krea2_task if spec.is_krea else KREA2_TEXT_TO_IMAGE_TASK,
+        visible=spec.is_krea,
+        info="Image Edit uses paired target/reference images and currently supports LoRA only.",
     )
 
     with gr.Row():
@@ -1454,9 +1609,9 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
         ) as folder_mode_column:
             with gr.Row():
                 parent_folder_path = gr.Textbox(
-                    label="Parent Dataset Folder",
+                    label="Target Image Directory / Parent Dataset Folder",
                     value=config.get("parent_folder_path", ""),
-                    info="Parent folder containing repeat-prefixed training folders.",
+                    info="Image Edit: target images. Text-to-Image: parent folder containing repeat-prefixed folders.",
                 )
                 parent_folder_button = gr.Button(
                     "📂", size="lg", scale=0, min_width=60, elem_classes=["mbtn", "mbtn-pink"], visible=not headless
@@ -1464,6 +1619,62 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
                 parent_folder_button.click(
                     fn=lambda: get_folder_path(folder_path=""),
                     outputs=[parent_folder_path],
+                )
+            with gr.Column(visible=initial_image_edit) as edit_dataset_column:
+                with gr.Row():
+                    reference_directory = gr.Textbox(
+                        label="Source Image Directory",
+                        value=config.get("reference_directory", ""),
+                        info="Required. Filenames must stem-match target images.",
+                    )
+                    reference_directory_button = gr.Button(
+                        "📂", size="lg", scale=0, min_width=60, elem_classes=["mbtn", "mbtn-pink"], visible=not headless
+                    )
+                    reference_directory_button.click(
+                        fn=lambda: get_folder_path(folder_path=""),
+                        outputs=[reference_directory],
+                    )
+                with gr.Row():
+                    reference_directory_2 = gr.Textbox(
+                        label="Second Source Image Directory (Optional)",
+                        value=config.get("reference_directory_2", ""),
+                        info="Optional second stem-matched reference, packed after the first source.",
+                    )
+                    reference_directory_2_button = gr.Button(
+                        "📂", size="lg", scale=0, min_width=60, elem_classes=["mbtn", "mbtn-cyan"], visible=not headless
+                    )
+                    reference_directory_2_button.click(
+                        fn=lambda: get_folder_path(folder_path=""),
+                        outputs=[reference_directory_2],
+                    )
+                with gr.Row():
+                    edit_fit_protocol = gr.Textbox(
+                        label="Reference Fit Protocol",
+                        value=config.get("edit_fit_protocol", KREA2_EDIT_FIT_PROTOCOL),
+                        interactive=False,
+                    )
+                    grounding_pixels = gr.Slider(
+                        label="Grounding Longest Side",
+                        minimum=384,
+                        maximum=768,
+                        step=16,
+                        value=config.get("grounding_pixels", 768),
+                    )
+                    edit_text_cache_policy = gr.Dropdown(
+                        label="Grounded Text Cache Policy",
+                        choices=KREA2_EDIT_TEXT_CACHE_POLICIES,
+                        value=config.get("edit_text_cache_policy", KREA2_EDIT_TEXT_CACHE_GENERATE),
+                        allow_custom_value=False,
+                    )
+            if not spec.is_krea:
+                reference_directory = gr.Textbox(value="", visible=False)
+                reference_directory_2 = gr.Textbox(value="", visible=False)
+                edit_fit_protocol = gr.Textbox(value=KREA2_EDIT_FIT_PROTOCOL, visible=False)
+                grounding_pixels = gr.Number(value=768, visible=False)
+                edit_text_cache_policy = gr.Dropdown(
+                    choices=KREA2_EDIT_TEXT_CACHE_POLICIES,
+                    value=KREA2_EDIT_TEXT_CACHE_GENERATE,
+                    visible=False,
                 )
             with gr.Row():
                 dataset_resolution_width = gr.Number(
@@ -1480,9 +1691,10 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
                 )
                 dataset_batch_size = gr.Number(
                     label="Dataset Batch Size",
-                    value=config.get("dataset_batch_size", 1),
+                    value=1 if initial_image_edit else config.get("dataset_batch_size", 1),
                     minimum=1,
                     step=1,
+                    interactive=not initial_image_edit,
                 )
             with gr.Row():
                 dataset_caption_extension = gr.Textbox(
@@ -1536,6 +1748,9 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
                     dataset_bucket_no_upscale,
                     dataset_cache_directory,
                     save_load.output_dir,
+                    krea2_task,
+                    reference_directory,
+                    reference_directory_2,
                 ],
                 outputs=[dataset_config, generated_toml_path, dataset_status],
             )
@@ -1882,6 +2097,7 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
     sample_accordion = gr.Accordion(
         "Sample Generation Settings",
         open=False,
+        visible=not initial_image_edit,
         elem_classes="samples_background",
     )
     accordions.append(sample_accordion)
@@ -2015,6 +2231,7 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
             cache_text_encoder_outputs = gr.Checkbox(
                 label="Run Text Encoder Caching",
                 value=bool(config.get("cache_text_encoder_outputs", True)),
+                visible=not initial_image_edit,
             )
             caching_teo_device = gr.Textbox(
                 label="Text Cache Device",
@@ -2152,6 +2369,7 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
         advanced.additional_parameters,
         advanced.debug_mode,
         training_mode,
+        krea2_task,
         # Dataset
         dataset_config_mode,
         dataset_config,
@@ -2166,6 +2384,11 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
         dataset_bucket_no_upscale,
         dataset_cache_directory,
         generated_toml_path,
+        reference_directory,
+        reference_directory_2,
+        edit_fit_protocol,
+        grounding_pixels,
+        edit_text_cache_policy,
         # Model
         dit,
         vae,
@@ -2416,6 +2639,35 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
         show_progress=False,
     )
 
+    def toggle_krea2_task(task, mode, current_batch_size):
+        image_edit, normalized_mode, samples_visible = resolve_krea2_task_state(spec, task, mode)
+        return (
+            gr.Column(visible=image_edit),
+            gr.update(value=normalized_mode, interactive=not image_edit),
+            gr.Accordion(visible=samples_visible),
+            gr.Accordion(visible=True),
+            gr.Accordion(visible=is_full_fine_tuning(normalized_mode)),
+            gr.Checkbox(visible=not image_edit),
+            gr.update(value=""),
+            gr.update(value=1 if image_edit else current_batch_size, interactive=not image_edit),
+        )
+
+    krea2_task.change(
+        fn=toggle_krea2_task,
+        inputs=[krea2_task, training_mode, dataset_batch_size],
+        outputs=[
+            edit_dataset_column,
+            training_mode,
+            sample_accordion,
+            network_accordion,
+            full_finetune_accordion,
+            cache_text_encoder_outputs,
+            generated_toml_path,
+            dataset_batch_size,
+        ],
+        show_progress=False,
+    )
+
     def sync_training_mode_visibility(mode):
         # Load/Open-triggered counterpart to toggle_training_mode: only
         # re-syncs accordion visibility. Deliberately does NOT also touch
@@ -2428,6 +2680,16 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
         # scope; leaving it as-is is safe and the user can adjust it manually.
         full_finetune = is_full_fine_tuning(mode)
         return gr.Accordion(visible=not full_finetune), gr.Accordion(visible=full_finetune)
+
+    def sync_krea2_task_visibility(task, mode, current_batch_size):
+        image_edit, normalized_mode, samples_visible = resolve_krea2_task_state(spec, task, mode)
+        return (
+            gr.Column(visible=image_edit),
+            gr.update(value=normalized_mode, interactive=not image_edit),
+            gr.Accordion(visible=samples_visible),
+            gr.Checkbox(visible=not image_edit),
+            gr.update(value=1 if image_edit else current_batch_size, interactive=not image_edit),
+        )
 
     action = partial(modern_image_gui_actions, spec_key)
     open_config_event = configuration.button_open_config.click(
@@ -2450,6 +2712,17 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
         inputs=[training_mode],
         outputs=[network_accordion, full_finetune_accordion],
         show_progress=False,
+    ).then(
+        fn=sync_krea2_task_visibility,
+        inputs=[krea2_task, training_mode, dataset_batch_size],
+        outputs=[
+            edit_dataset_column,
+            training_mode,
+            sample_accordion,
+            cache_text_encoder_outputs,
+            dataset_batch_size,
+        ],
+        show_progress=False,
     )
     load_config_event = configuration.button_load_config.click(
         action,
@@ -2469,6 +2742,17 @@ def modern_image_lora_tab(spec_key: str, headless: bool = False, config: GUIConf
         fn=sync_training_mode_visibility,
         inputs=[training_mode],
         outputs=[network_accordion, full_finetune_accordion],
+        show_progress=False,
+    ).then(
+        fn=sync_krea2_task_visibility,
+        inputs=[krea2_task, training_mode, dataset_batch_size],
+        outputs=[
+            edit_dataset_column,
+            training_mode,
+            sample_accordion,
+            cache_text_encoder_outputs,
+            dataset_batch_size,
+        ],
         show_progress=False,
     )
     configuration.button_save_config.click(

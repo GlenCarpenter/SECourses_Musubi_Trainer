@@ -9,6 +9,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 
 from musubi_tuner.hunyuan_model.models import load_transformer
+from musubi_tuner.krea2 import krea2_utils
 from musubi_tuner.networks import lora
 from musubi_tuner.qwen_image import qwen_image_model
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
@@ -61,7 +62,26 @@ def _load_base_model(
     model_type: str,
     dit_in_channels: int,
     device: torch.device,
+    lora_paths: Optional[List[str]] = None,
+    multipliers: Optional[List[float]] = None,
 ):
+    if model_type == "krea2":
+        log.info("Loading Krea 2 ConvRot INT8 transformer and merging LoRAs")
+        lora_weights = [load_file(path) for path in lora_paths or []]
+        transformer = krea2_utils.load_krea2_dit(
+            dit_path=dit_path,
+            device=device,
+            dtype=torch.bfloat16,
+            loading_device=device,
+            attn_mode="torch",
+            split_attn=False,
+            lora_weights=lora_weights,
+            lora_multipliers=multipliers,
+            convrot_int8=True,
+        )
+        transformer.eval()
+        return transformer
+
     if model_type == "qwen":
         log.info("Loading Qwen Image transformer for merge")
         transformer = qwen_image_model.load_qwen_image_model(
@@ -90,6 +110,37 @@ def _load_base_model(
     )
     transformer.eval()
     return transformer
+
+
+def _state_dict_for_save(transformer, model_type: str) -> Dict[str, torch.Tensor]:
+    state_dict = transformer.state_dict()
+    if model_type != "krea2":
+        return state_dict
+
+    groupsizes = {
+        name: module._convrot_groupsize
+        for name, module in transformer.named_modules()
+        if hasattr(module, "_convrot_groupsize")
+    }
+    portable_state_dict: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if not key.endswith(".scale_weight"):
+            portable_state_dict[key] = value
+            continue
+
+        module_path = key[: -len(".scale_weight")]
+        groupsize = groupsizes[module_path]
+        portable_state_dict[module_path + ".weight_scale"] = value
+        quant_spec = json.dumps(
+            {
+                "format": "int8_tensorwise",
+                "convrot": True,
+                "convrot_groupsize": groupsize,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        portable_state_dict[module_path + ".comfy_quant"] = torch.tensor(list(quant_spec), dtype=torch.uint8)
+    return portable_state_dict
 
 
 def _merge_loras_into_transformer(
@@ -154,18 +205,26 @@ def _merge_and_save(
     device = _resolve_device(device_choice)
     transformer = None
     try:
-        transformer = _load_base_model(dit_path, model_type, dit_in_channels, device)
-        success, merge_message = _merge_loras_into_transformer(
-            transformer,
-            lora_paths,
-            multipliers,
+        transformer = _load_base_model(
+            dit_path,
+            model_type,
+            dit_in_channels,
             device,
+            lora_paths=lora_paths if model_type == "krea2" else None,
+            multipliers=multipliers if model_type == "krea2" else None,
         )
+        if model_type != "krea2":
+            success, merge_message = _merge_loras_into_transformer(
+                transformer,
+                lora_paths,
+                multipliers,
+                device,
+            )
 
-        if not success:
-            return "error", f"Merge failed: {merge_message}"
+            if not success:
+                return "error", f"Merge failed: {merge_message}"
 
-        mem_eff_save_file(transformer.state_dict(), output_path)
+        mem_eff_save_file(_state_dict_for_save(transformer, model_type), output_path)
     except Exception as exc:
         log.exception("Failed to merge and save LoRA: %s", exc)
         return "error", f"Error during merge: {exc}"

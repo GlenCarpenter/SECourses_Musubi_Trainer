@@ -40,6 +40,7 @@ from .common_gui import (
     get_file_path,
     get_folder_path,
     get_file_path_or_save_as,
+    load_toml_sanitized,
     print_command_and_toml,
     resolve_portable_model_value,
     run_cmd_advanced_training,
@@ -1231,7 +1232,7 @@ def open_ltx2_configuration(ask_for_file: bool, file_path: str, parameters):
 
     try:
         with open(file_path, "r", encoding="utf-8-sig") as handle:
-            data = toml.load(handle)
+            data = load_toml_sanitized(handle)
         values = []
         for key, default in parameters:
             value = resolve_portable_model_value(key, data.get(key, default))

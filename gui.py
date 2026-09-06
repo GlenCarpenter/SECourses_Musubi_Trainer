@@ -22,6 +22,7 @@ from musubi_tuner_gui.image_preprocessing_gui import image_preprocessing_tab
 from musubi_tuner_gui.changelog_gui import version_history_tab
 from musubi_tuner_gui.lora_extractor_gui import lora_extractor_tab
 from musubi_tuner_gui.lora_merge_gui import lora_merge_tab
+from musubi_tuner_gui.krea2_checkpoint_merge_gui import krea2_checkpoint_merge_tab
 from musubi_tuner_gui.lora_convert_gui import lora_convert_tab
 from musubi_tuner_gui.custom_logging import setup_logging
 from musubi_tuner_gui.class_gui_config import GUIConfig
@@ -108,6 +109,9 @@ def initialize_ui_interface(config_manager, headless, release_info, readme_conte
 
         with gr.Tab("LoRA Merger"):
             lora_merge_tab(headless=headless, config=None)
+
+        with gr.Tab("Krea 2 Checkpoint Merger"):
+            krea2_checkpoint_merge_tab(headless=headless, config=None)
 
         with gr.Tab("LoRA Converter"):
             lora_convert_tab(headless=headless, config=None)

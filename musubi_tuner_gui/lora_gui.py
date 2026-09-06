@@ -21,6 +21,7 @@ from .common_gui import (
     get_file_path,
     get_file_path_or_save_as,
     get_saveasfile_path,
+    load_toml_sanitized,
     print_command_and_toml,
     run_cmd_advanced_training,
     SaveConfigFile,
@@ -375,7 +376,7 @@ def open_configuration(
 
         # Load variables from TOML file
         with open(file_path, "r", encoding="utf-8") as f:
-            my_data = toml.load(f)
+            my_data = load_toml_sanitized(f)
             log.info("Loading config...")
             gr.Info(f"Configuration loaded from: {os.path.basename(file_path)}")
     else:

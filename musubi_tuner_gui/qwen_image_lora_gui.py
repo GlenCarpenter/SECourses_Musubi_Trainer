@@ -31,6 +31,7 @@ from .common_gui import (
     get_file_path_or_save_as,
     get_folder_path,
     get_saveasfile_path,
+    load_toml_sanitized,
     print_command_and_toml,
     resolve_portable_model_value,
     run_cmd_advanced_training,
@@ -1623,7 +1624,7 @@ def open_qwen_image_configuration(ask_for_file, file_path, parameters):
 
         try:
             with open(file_path, "r", encoding="utf-8-sig") as f:
-                my_data = toml.load(f)
+                my_data = load_toml_sanitized(f)
                 config_name = os.path.basename(file_path)
                 status_msg = f"Configuration loaded successfully from: {config_name}"
                 log.info(status_msg)
@@ -2078,7 +2079,7 @@ def train_qwen_image_model(headless, print_only, parameters):
     # Validate the TOML file can be parsed
     try:
         with open(effective_dataset_config, 'r', encoding='utf-8') as f:
-            dataset_config_content = toml.load(f)
+            dataset_config_content = load_toml_sanitized(f)
         if not dataset_config_content.get("datasets"):
             raise ValueError(
                 f"[ERROR] Invalid dataset config: No datasets defined in {effective_dataset_config}\n"
@@ -2734,7 +2735,7 @@ def train_qwen_image_model(headless, print_only, parameters):
         # Verify TOML file was created and check its contents
         if os.path.exists(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
-                toml_content = toml.load(f)
+                toml_content = load_toml_sanitized(f)
                 disable_numpy_memmap_in_toml = toml_content.get("disable_numpy_memmap", None)
                 metadata_arch_in_toml = toml_content.get("metadata_arch", None)
                 use_pinned_memory_in_toml = toml_content.get("use_pinned_memory_for_block_swap", None)

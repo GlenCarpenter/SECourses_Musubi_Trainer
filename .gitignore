@@ -15,6 +15,14 @@ logs/
 downloads/
 eggs/
 benchmarks
+!benchmarks/
+benchmarks/*
+!benchmarks/krea2_edit/
+!benchmarks/krea2_edit/phase5_results.md
+!benchmarks/krea2_edit/phase7/
+benchmarks/krea2_edit/phase7/*
+!benchmarks/krea2_edit/phase7/*.py
+!benchmarks/krea2_edit/phase7/README.md
 .claude/
 ai-toolkit
 .eggs/
@@ -211,4 +219,11 @@ tests/*
 !tests/test_automagic_gui.py
 !tests/test_model_quantizer_gui.py
 !tests/test_torch_compile_gui_environment.py
+!tests/test_krea2_edit_comfyui_compatibility.py
 !tests/test_minimax_h3_gui.py
+!tests/test_lora_merge_gui.py
+!tests/test_krea2_checkpoint_merge.py
+!tests/test_krea2_edit_conditioning.py
+!tests/test_krea2_edit_cache.py
+!tests/test_krea2_edit_text_conditioning.py
+!tests/test_krea2_edit_trainer.py
