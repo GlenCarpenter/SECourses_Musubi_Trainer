@@ -227,3 +227,5 @@ tests/*
 !tests/test_krea2_edit_cache.py
 !tests/test_krea2_edit_text_conditioning.py
 !tests/test_krea2_edit_trainer.py
+krea2_INT8_convrot-EDIT.toml
+krea2_INT8_convrot.toml
